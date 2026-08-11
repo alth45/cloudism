@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+
+
+# Hashing/Kripto (opsional, bisa diganti)
+argon2-cffi
+pynacl
