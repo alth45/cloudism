@@ -57,3 +57,19 @@ CREATE INDEX IF NOT EXISTS idx_objects_public ON objects(is_public);
 CREATE INDEX IF NOT EXISTS idx_objects_bucket ON objects(bucket_id);
 CREATE INDEX IF NOT EXISTS idx_acl_object ON acl(object_id);
 CREATE INDEX IF NOT EXISTS idx_acl_user ON acl(user_id);
+-- Kunci objek ter-bungkus (re-encryption via key-wrapping/PBKDF2).
+-- Setiap baris = satu DEK yang di-wrap memakai KEK turunan passphrase
+-- pembagian, khusus untuk satu pengguna (recipient).
+CREATE TABLE IF NOT EXISTS object_keys (
+    object_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    wrapped_key TEXT NOT NULL,   -- DEK terenkripsi AES-256-CTR (base64)
+    wrap_nonce TEXT NOT NULL,    -- nonce CTR untuk wrapping (base64)
+    wrap_salt TEXT NOT NULL,     -- salt PBKDF2 (hex)
+    iterations INTEGER NOT NULL DEFAULT 100000,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (object_id, user_id),
+    FOREIGN KEY (object_id) REFERENCES objects(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_object_keys_user ON object_keys(user_id);

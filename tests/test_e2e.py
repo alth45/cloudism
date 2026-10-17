@@ -231,3 +231,177 @@ class TestBucketFlow:
         for bad in ["ab", "Ada-Huruf-Besar", "-awali-strip", "ada spasi"]:
             resp = client.post("/buckets", json={"name": bad}, headers=auth_header(token))
             assert resp.status_code == 422, f"nama '{bad}' seharusnya ditolak"
+
+# ==================== RE-ENCRYPTION SAAT SHARING (key-wrapping/PBKDF2) ====================
+
+from cloudsim.crypto.key_wrapping import generate_dek, wrap_key, unwrap_key, derive_wrap_key
+
+class TestReEncryptionShare:
+    """Uji fitur re-encryption saat sharing memakai key-wrapping + PBKDF2."""
+
+    def test_unit_wrap_unwrap_roundtrip(self):
+        """DEK yang di-wrap lalu di-unwrap dengan passphrase benar harus kembali identik."""
+        dek = generate_dek()
+        assert len(dek) == 32
+        w = wrap_key(dek, "rahasia-share")
+        restored = unwrap_key(w["wrapped_key"], w["wrap_nonce"], w["wrap_salt"],
+                              "rahasia-share", iterations=w["iterations"])
+        assert restored == dek
+        # Passphrase salah -> DEK tidak dipulihkan dengan benar
+        wrong = unwrap_key(w["wrapped_key"], w["wrap_nonce"], w["wrap_salt"],
+                           "passsalah", iterations=w["iterations"])
+        assert wrong != dek
+        # Salt acak per pembungkusan -> ciphertext wrapping berbeda
+        w2 = wrap_key(dek, "rahasia-share")
+        assert w2["wrap_salt"] != w["wrap_salt"]
+        assert w2["wrapped_key"] != w["wrapped_key"]
+
+    def test_unit_pbkdf2_deterministic(self):
+        """Derivasi KEK dari passphrase+salt yang sama harus deterministik."""
+        salt = bytes.fromhex("00" * 16)
+        k1 = derive_wrap_key("p@ss", salt, iterations=1000)
+        k2 = derive_wrap_key("p@ss", salt, iterations=1000)
+        assert k1 == k2 and len(k1) == 32
+
+    def test_share_reencryption_full_flow(self, client):
+        """Alur penuh: upload shareable -> share (re-wrap DEK) -> penerima bisa dekripsi."""
+        token1, uid1, key1 = register_and_get_key(client, "ardi", "passA123")
+        token2, uid2, key2 = register_and_get_key(client, "budi", "passB123")
+
+        plaintext = b"data rahasia untuk dibagikan"
+        dek = generate_dek()
+        enc_b64, nonce_b64 = encrypt_file(plaintext, dek)
+        owner_wrapping = wrap_key(dek, "kata-sambutan")
+
+        # 1. Upload dengan wrapped DEK milik owner
+        resp = client.post(
+            "/objects/upload",
+            json={
+                "encrypted_payload": enc_b64,
+                "nonce": nonce_b64,
+                "filename": "berbagi.txt",
+                "mime_type": "text/plain",
+                "dek_wrapping": owner_wrapping,
+            },
+            headers=auth_header(token1),
+        )
+        assert resp.status_code == 200, resp.text
+        obj_id = resp.json()["id"]
+
+        # 2. Budi belum bisa akses sama sekali
+        resp = client.get(f"/objects/{obj_id}/download", headers=auth_header(token2))
+        assert resp.status_code == 404
+
+        # 3. Ardi share ke Budi DENGAN re-encryption:
+        #    DEK di-re-wrap memakai passphrase pembagian (PBKDF2-derived KEK)
+        share_pass = "kanal-aman-123"
+        recipient_wrapping = wrap_key(dek, share_pass)
+        resp = client.post(
+            f"/objects/{obj_id}/share",
+            json={"username": "budi", "permission": "read",
+                  "dek_wrapping": recipient_wrapping},
+            headers=auth_header(token1),
+        )
+        assert resp.status_code == 200, resp.text
+        assert "re-encryption" in resp.json()["detail"]
+
+        # 4. Download Budi kini menyertakan wrapped key miliknya sendiri
+        resp = client.get(f"/objects/{obj_id}/download", headers=auth_header(token2))
+        assert resp.status_code == 200
+        data = resp.json()
+        wk = data.get("wrapped_key")
+        assert wk is not None, "respons download harus memuat wrapped DEK utk penerima"
+        assert wk["wrapped_key"] != owner_wrapping["wrapped_key"], \
+            "wrapped key penerima harus hasil re-encryption, bukan salinan milik owner"
+
+        # 5. Budi memulihkan DEK via passphrase dan mendekripsi dengan benar
+        restored_dek = unwrap_key(wk["wrapped_key"], wk["wrap_nonce"], wk["wrap_salt"],
+                                  share_pass, iterations=int(wk["iterations"]))
+        assert restored_dek == dek
+        assert decrypt_file(data["encrypted_payload"], data["nonce"], restored_dek) == plaintext
+
+        # 6. Passphrase salah -> DEK gagal dipulihkan -> dekripsi menghasilkan sampah
+        bad_dek = unwrap_key(wk["wrapped_key"], wk["wrap_nonce"], wk["wrap_salt"],
+                             "passsalah", iterations=int(wk["iterations"]))
+        assert decrypt_file(data["encrypted_payload"], data["nonce"], bad_dek) != plaintext
+
+        # 7. Owner juga tetap bisa membuka lewat wrapped key miliknya
+        resp = client.get(f"/objects/{obj_id}/download", headers=auth_header(token1))
+        assert resp.status_code == 200
+        owk = resp.json()["wrapped_key"]
+        owner_dek = unwrap_key(owk["wrapped_key"], owk["wrap_nonce"], owk["wrap_salt"],
+                               "kata-sambutan", iterations=int(owk["iterations"]))
+        assert owner_dek == dek
+
+        # 8. Daftar shares: owner + budi
+        resp = client.get(f"/objects/{obj_id}/shares", headers=auth_header(token1))
+        assert resp.status_code == 200
+        users = {s["username"] for s in resp.json()}
+        assert users == {"ardi", "budi"}
+
+        # 9. Revoke Budi -> wrapped key & ACL hilang, Budi tak bisa akses lagi
+        resp = client.post(f"/objects/{obj_id}/revoke",
+                           json={"username": "budi"}, headers=auth_header(token1))
+        assert resp.status_code == 200
+        resp = client.get(f"/objects/{obj_id}/download", headers=auth_header(token2))
+        assert resp.status_code == 404
+
+    def test_legacy_share_without_reencryption_still_works(self, client):
+        """Kompatibilitas mundur: share tanpa dek_wrapping hanya bagikan ACL."""
+        token1, _, key1 = register_and_get_key(client, "citra", "passC123")
+        token2, _, key2 = register_and_get_key(client, "dwi", "passD123")
+        plaintext = b"mode lama"
+        enc_b64, nonce_b64 = encrypt_file(plaintext, key1)
+        resp = client.post(
+            "/objects/upload",
+            json={"encrypted_payload": enc_b64, "nonce": nonce_b64, "filename": "lama.txt"},
+            headers=auth_header(token1),
+        )
+        obj_id = resp.json()["id"]
+        resp = client.post(f"/objects/{obj_id}/share",
+                           json={"username": "dwi", "permission": "read"},
+                           headers=auth_header(token1))
+        assert resp.status_code == 200
+        resp = client.get(f"/objects/{obj_id}/download", headers=auth_header(token2))
+        assert resp.status_code == 200
+        assert "wrapped_key" not in resp.json()
+        # Dekripsi dg kunci Citra tetap benar; dg kunci Dwi tetap garbage
+        d = resp.json()
+        assert decrypt_file(d["encrypted_payload"], d["nonce"], key1) == plaintext
+        assert decrypt_file(d["encrypted_payload"], d["nonce"], key2) != plaintext
+
+    def test_share_invalid_wrapping_rejected(self, client):
+        """Payload dek_wrapping tidak valid ditolak dengan 422."""
+        token1, _, key1 = register_and_get_key(client, "ardi", "passA123")
+        client.post("/auth/register", json={"username": "budi", "password": "passB123"})
+        resp = client.post(
+            "/objects/upload",
+            json={"encrypted_payload": "AAA=", "nonce": "AAA=", "filename": "x.txt"},
+            headers=auth_header(token1),
+        )
+        obj_id = resp.json()["id"]
+        resp = client.post(
+            f"/objects/{obj_id}/share",
+            json={"username": "budi", "permission": "read",
+                  "dek_wrapping": {"wrapped_key": "xxx"}},  # tidak lengkap
+            headers=auth_header(token1),
+        )
+        assert resp.status_code == 422
+
+    def test_delete_object_removes_wrapped_keys(self, client):
+        """Wrapped keys ikut terhapus saat objek dihapus (ON DELETE CASCADE)."""
+        token1, _, _ = register_and_get_key(client, "ardi", "passA123")
+        dek = generate_dek()
+        enc_b64, nonce_b64 = encrypt_file(b"x", dek)
+        resp = client.post(
+            "/objects/upload",
+            json={"encrypted_payload": enc_b64, "nonce": nonce_b64,
+                  "filename": "y.txt", "dek_wrapping": wrap_key(dek, "p")},
+            headers=auth_header(token1),
+        )
+        obj_id = resp.json()["id"]
+        from cloudsim.db.database import db as current_db
+        assert len(current_db.list_object_keys(obj_id)) == 1
+        resp = client.delete(f"/objects/{obj_id}", headers=auth_header(token1))
+        assert resp.status_code == 200
+        assert current_db.list_object_keys(obj_id) == []

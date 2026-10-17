@@ -3,8 +3,10 @@ import os
 # pyrefly: ignore [missing-import]
 import typer
 import requests
-from cloudsim.cli.auth_commands import get_token_and_key, API_BASE
+from getpass import getpass
+from cloudsim.cli.auth_commands import get_token_and_key, API_BASE, load_session
 from cloudsim.crypto.aes_custom import AES256CTR
+from cloudsim.crypto.key_wrapping import generate_dek, wrap_key, unwrap_key
 from cloudsim.crypto.utils import encode_base64, decode_base64
 
 app = typer.Typer(help="Manajemen objek")
@@ -12,9 +14,77 @@ app = typer.Typer(help="Manajemen objek")
 def _get_headers(token: str):
     return {"Authorization": f"Bearer {token}"}
 
+
+def _session_deks() -> dict:
+    """Peta object_id -> DEK (hex) yang diketahui sesi ini (hasil upload/share)."""
+    session = load_session() or {}
+    return session.get("dek_cache", {}) or {}
+
+
+def _remember_dek(object_id: str, dek: bytes):
+    """Simpan DEK objek ke cache sesi agar bisa di-re-wrap saat sharing."""
+    session = load_session()
+    if not session:
+        return
+    cache = session.setdefault("dek_cache", {})
+    cache[object_id] = dek.hex()
+    # Batasi ukuran cache sederhana
+    if len(cache) > 200:
+        for k in list(cache.keys())[:-200]:
+            cache.pop(k)
+    from cloudsim.cli.auth_commands import ensure_config_dir, CONFIG_FILE
+    ensure_config_dir()
+    import json
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(session, f)
+
+
+def _ask_share_passphrase(confirm: bool = False) -> str:
+    from getpass import getpass as _gp
+    p1 = _gp("Passphrase pembagian (untuk key-wrapping): ")
+    if confirm:
+        p2 = _gp("Konfirmasi passphrase: ")
+        if p1 != p2:
+            print("Passphrase tidak cocok.")
+            raise typer.Exit(code=1)
+    if not p1:
+        print("Passphrase tidak boleh kosong.")
+        raise typer.Exit(code=1)
+    return p1
+
+
+def _decrypt_with_fallback(data: dict, key: bytes, share_pass: str | None = None) -> tuple[bytes, str]:
+    """Dekripsi payload. Kembalikan (plaintext, metode).
+
+    Metode 'dek'  : wrapped key tersedia + passphrase benar -> DEK dipulihkan
+                    (alur re-encryption/key-wrapping).
+    Metode 'user-key': mode lama, payload dienkripsi dengan kunci user.
+    """
+    wk = data.get("wrapped_key")
+    passphrase = share_pass or os.environ.get("CLOUDSIM_SHARE_PASS")
+    if wk and passphrase:
+        dek = unwrap_key(wk["wrapped_key"], wk["wrap_nonce"], wk["wrap_salt"],
+                         passphrase, iterations=int(wk.get("iterations", 100000)))
+        plaintext = AES256CTR(dek).decrypt(
+            decode_base64(data["encrypted_payload"]), decode_base64(data["nonce"]))
+        return plaintext, "dek"
+    plaintext = AES256CTR(key).decrypt(
+        decode_base64(data["encrypted_payload"]), decode_base64(data["nonce"]))
+    return plaintext, "user-key"
+
 @app.command("upload")
-def upload(filepath: str = typer.Argument(..., help="Path file yang akan diunggah")):
-    """Unggah file ke cloud (dienkripsi di sisi client)."""
+def upload(filepath: str = typer.Argument(..., help="Path file yang akan diunggah"),
+           shareable: bool = typer.Option(False, "--shareable",
+                                          help="Enkripsi via DEK + key-wrapping agar file bisa dibagikan dan didekripsi penerima (re-encryption)"),
+           passphrase: str = typer.Option(None, "--passphrase",
+                                          help="Passphrase pembungkus DEK (tanpa opsi ini akan ditanya aman via getpass)")):
+    """Unggah file ke cloud (dienkripsi di sisi client).
+
+    Mode default: payload dienkripsi dengan kunci user (mode lama).
+    Mode --shareable: payload dienkripsi dengan DEK acak; DEK dibungkus
+    (key-wrapping) memakai KEK hasil PBKDF2(passphrase) sehingga nanti bisa
+    di-re-encryption saat `share`.
+    """
     token, key = get_token_and_key()
     if not token or not key:
         print("Anda belum login. Silakan login dulu.")
@@ -27,9 +97,19 @@ def upload(filepath: str = typer.Argument(..., help="Path file yang akan diungga
     with open(filepath, "rb") as f:
         plaintext = f.read()
 
-    # Enkripsi dengan kunci pengguna
-    cipher = AES256CTR(key)
-    encrypted, nonce = cipher.encrypt(plaintext)
+    dek_wrapping = None
+    dek = None
+    if shareable:
+        pp = passphrase or _ask_share_passphrase(confirm=True)
+        dek = generate_dek()
+        cipher = AES256CTR(dek)
+        encrypted, nonce = cipher.encrypt(plaintext)
+        # Bungkus DEK utk owner (diri sendiri) dg passphrase yg sama
+        dek_wrapping = wrap_key(dek, pp)
+    else:
+        # Enkripsi dengan kunci pengguna
+        cipher = AES256CTR(key)
+        encrypted, nonce = cipher.encrypt(plaintext)
 
     payload_b64 = encode_base64(encrypted)
     nonce_b64 = encode_base64(nonce)
@@ -40,6 +120,8 @@ def upload(filepath: str = typer.Argument(..., help="Path file yang akan diungga
         "filename": filename,
         "mime_type": "application/octet-stream"
     }
+    if dek_wrapping:
+        req_data["dek_wrapping"] = dek_wrapping
 
     try:
         resp = requests.post(
@@ -49,12 +131,16 @@ def upload(filepath: str = typer.Argument(..., help="Path file yang akan diungga
         )
         if resp.status_code == 200:
             meta = resp.json()
+            if dek is not None:
+                _remember_dek(meta["id"], dek)
             print(f"Upload berhasil!")
             print(f"  ID        : {meta['id']}")
             print(f"  Nama file : {meta['filename']}")
             print(f"  Ukuran    : {meta['size']} bytes")
             print(f"  Tipe      : {meta['mime_type']}")
             print(f"  Dibuat    : {meta['created_at']}")
+            if dek_wrapping:
+                print("  Mode      : shareable (DEK di-wrap via PBKDF2/key-wrapping)")
         else:
             print(f"Gagal: {resp.json().get('detail', resp.text)}")
     except requests.ConnectionError:
@@ -102,8 +188,15 @@ def info(object_id: str = typer.Argument(..., help="ID objek")):
 
 @app.command("download")
 def download(object_id: str = typer.Argument(..., help="ID objek"),
-             output: str = typer.Option(None, "--output", "-o", help="Path file output")):
-    """Unduh file dari cloud (didekripsi di sisi client)."""
+             output: str = typer.Option(None, "--output", "-o", help="Path file output"),
+             passphrase: str = typer.Option(None, "--passphrase",
+                                            help="Passphrase pembagian utk membuka wrapped DEK (re-encryption)")):
+    """Unduh file dari cloud (didekripsi di sisi client).
+
+    Jika respons server menyertakan wrapped key dan Anda memberi passphrase
+    (atau env CLOUDSIM_SHARE_PASS), DEK dipulihkan via PBKDF2+key-unwrapping
+    lalu payload didekripsi dengan DEK tersebut.
+    """
     token, key = get_token_and_key()
     if not token or not key:
         return
@@ -114,17 +207,29 @@ def download(object_id: str = typer.Argument(..., help="ID objek"),
             print(f"Gagal: {resp.json().get('detail', resp.text)}")
             return
         data = resp.json()
-        encrypted = decode_base64(data["encrypted_payload"])
-        nonce = decode_base64(data["nonce"])
 
-        # Dekripsi
-        cipher = AES256CTR(key)
-        plaintext = cipher.decrypt(encrypted, nonce)
+        pp = passphrase
+        if data.get("wrapped_key") and not pp and not os.environ.get("CLOUDSIM_SHARE_PASS"):
+            pp = _ask_share_passphrase()
+
+        plaintext, method = _decrypt_with_fallback(data, key, share_pass=pp)
 
         filename = output or data["filename"]
         with open(filename, "wb") as f:
             f.write(plaintext)
-        print(f"File berhasil diunduh: {filename}")
+        if method == "dek":
+            # ingat DEK-nya utk sesi ini (berguna bila kita ikut membagikan ulang)
+            dek_hex = None
+            wk = data.get("wrapped_key")
+            if wk and pp:
+                dek = unwrap_key(wk["wrapped_key"], wk["wrap_nonce"], wk["wrap_salt"],
+                                 pp, iterations=int(wk.get("iterations", 100000)))
+                dek_hex = dek.hex()
+            if dek_hex:
+                _remember_dek(object_id, bytes.fromhex(dek_hex))
+            print(f"File berhasil diunduh: {filename} (dekripsi via re-encryption/key-wrapping)")
+        else:
+            print(f"File berhasil diunduh: {filename}")
     except requests.ConnectionError:
         print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
 
@@ -146,19 +251,91 @@ def delete(object_id: str = typer.Argument(..., help="ID objek")):
 @app.command("share")
 def share(object_id: str = typer.Argument(..., help="ID objek"),
           username: str = typer.Argument(..., help="Username tujuan"),
-          permission: str = typer.Option("read", "--perm", "-p", help="Izin: read/write/admin")):
-    """Bagikan akses objek ke pengguna lain."""
+          permission: str = typer.Option("read", "--perm", "-p", help="Izin: read/write/admin"),
+          passphrase: str = typer.Option(None, "--passphrase",
+                                         help="Passphrase pembagian; DEK objek di-re-encrypt (key-wrapping/PBKDF2) utk penerima"),
+          no_reencrypt: bool = typer.Option(False, "--no-reencrypt",
+                                            help="Mode lama: hanya bagikan ACL, tanpa re-encryption")):
+    """Bagikan akses objek ke pengguna lain.
+
+    Secara default melakukan RE-ENCRYPTION: DEK objek dibungkus ulang
+    (key-wrapping) memakai KEK hasil PBKDF2(passphrase) milik penerima,
+    sehingga penerima dapat mendekripsi isi file. Passphrase harus
+    disampaikan ke penerima melalui kanal aman.
+    """
+    token, _ = get_token_and_key()
+    if not token:
+        return
+
+    dek_wrapping = None
+    if not no_reencrypt:
+        dek_hex = _session_deks().get(object_id)
+        if not dek_hex:
+            print("Objek ini tidak memiliki wrapped DEK yang diketahui sesi ini.")
+            print("Upload ulang dengan `upload --shareable` atau gunakan --no-reencrypt.")
+            return
+        pp = passphrase or _ask_share_passphrase(confirm=True)
+        dek = bytes.fromhex(dek_hex)
+        # Re-encryption: bungkus ulang DEK utk penerima
+        dek_wrapping = wrap_key(dek, pp)
+
+    try:
+        body = {"username": username, "permission": permission}
+        if dek_wrapping:
+            body["dek_wrapping"] = dek_wrapping
+        resp = requests.post(
+            f"{API_BASE}/objects/{object_id}/share",
+            json=body,
+            headers=_get_headers(token)
+        )
+        if resp.status_code == 200:
+            print(resp.json()["detail"])
+            if dek_wrapping:
+                print(f"Sampaikan passphrase pembagian ke {username} lewat kanal aman agar bisa mendekripsi.")
+        else:
+            print(f"Gagal: {resp.json().get('detail', resp.text)}")
+    except requests.ConnectionError:
+        print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
+
+
+@app.command("revoke")
+def revoke(object_id: str = typer.Argument(..., help="ID objek"),
+           username: str = typer.Argument(..., help="Username yang dicabut aksesnya")):
+    """Cabut akses user pada objek (ACL + wrapped key ikut dihapus)."""
     token, _ = get_token_and_key()
     if not token:
         return
     try:
         resp = requests.post(
-            f"{API_BASE}/objects/{object_id}/share",
-            json={"username": username, "permission": permission},
+            f"{API_BASE}/objects/{object_id}/revoke",
+            json={"username": username},
             headers=_get_headers(token)
         )
         if resp.status_code == 200:
             print(resp.json()["detail"])
+        else:
+            print(f"Gagal: {resp.json().get('detail', resp.text)}")
+    except requests.ConnectionError:
+        print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
+
+
+@app.command("shares")
+def shares(object_id: str = typer.Argument(..., help="ID objek")):
+    """Daftar pengguna yang memegang wrapped key pada objek."""
+    token, _ = get_token_and_key()
+    if not token:
+        return
+    try:
+        resp = requests.get(f"{API_BASE}/objects/{object_id}/shares", headers=_get_headers(token))
+        if resp.status_code == 200:
+            rows = resp.json()
+            if not rows:
+                print("Tidak ada wrapped key tersimpan untuk objek ini.")
+                return
+            print(f"{'User':<20} {'Izin':<8} {'Dibuat':<26}")
+            print("-" * 56)
+            for r in rows:
+                print(f"{r['username']:<20} {r['permission']:<8} {r['created_at']:<26}")
         else:
             print(f"Gagal: {resp.json().get('detail', resp.text)}")
     except requests.ConnectionError:
