@@ -17,6 +17,10 @@ def generate_bucket_id() -> str:
     """ID bucket: bkt-{8 hex}"""
     return f"bkt-{_random_hex(8)}"
 
+def generate_version_id() -> str:
+    """ID versi objek: ver-{12 hex} (flag identitas satu versi objek)"""
+    return f"ver-{_random_hex(12)}"
+
 
 def generate_token_id() -> str:
     """ID token: tok-{24 hex} (untuk header JWT)"""

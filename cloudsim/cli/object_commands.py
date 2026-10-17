@@ -190,7 +190,9 @@ def info(object_id: str = typer.Argument(..., help="ID objek")):
 def download(object_id: str = typer.Argument(..., help="ID objek"),
              output: str = typer.Option(None, "--output", "-o", help="Path file output"),
              passphrase: str = typer.Option(None, "--passphrase",
-                                            help="Passphrase pembagian utk membuka wrapped DEK (re-encryption)")):
+                                            help="Passphrase pembagian utk membuka wrapped DEK (re-encryption)"),
+             version_id: str = typer.Option(None, "--version-id",
+                                            help="Unduh versi tertentu (ver-...); default versi current")):
     """Unduh file dari cloud (didekripsi di sisi client).
 
     Jika respons server menyertakan wrapped key dan Anda memberi passphrase
@@ -202,7 +204,9 @@ def download(object_id: str = typer.Argument(..., help="ID objek"),
         return
     try:
         # Ambil data terenkripsi dari API
-        resp = requests.get(f"{API_BASE}/objects/{object_id}/download", headers=_get_headers(token))
+        params = {"version_id": version_id} if version_id else None
+        resp = requests.get(f"{API_BASE}/objects/{object_id}/download",
+                            headers=_get_headers(token), params=params)
         if resp.status_code != 200:
             print(f"Gagal: {resp.json().get('detail', resp.text)}")
             return
@@ -340,6 +344,56 @@ def shares(object_id: str = typer.Argument(..., help="ID objek")):
             print(f"Gagal: {resp.json().get('detail', resp.text)}")
     except requests.ConnectionError:
         print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
+
+@app.command("versions")
+def versions(object_id: str = typer.Argument(..., help="ID objek")):
+    """Daftar seluruh versi objek (versioning nyata) beserta flag current."""
+    token, _ = get_token_and_key()
+    if not token:
+        return
+    try:
+        resp = requests.get(f"{API_BASE}/objects/{object_id}/versions", headers=_get_headers(token))
+        if resp.status_code == 200:
+            rows = resp.json()
+            if not rows:
+                print("Tidak ada versi untuk objek ini.")
+                return
+            print(f"{'Version ID':<18} {'Ver':>4} {'Ukuran':>8}  {'Current':<8} {'Dibuat':<26}")
+            print("-" * 72)
+            for r in rows:
+                cur = "YA" if r["current"] else ""
+                print(f"{r['version_id']:<18} {r['version']:>4} {r['size']:>8}  {cur:<8} {r['created_at']:<26}")
+        else:
+            print(f"Gagal: {resp.json().get('detail', resp.text)}")
+    except requests.ConnectionError:
+        print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
+
+
+@app.command("restore")
+def restore(object_id: str = typer.Argument(..., help="ID objek"),
+            version_id: str = typer.Argument(..., help="ID versi lama yang ingin dipulihkan (ver-...)")):
+    """Restore versi lama menjadi versi aktif.
+
+    Non-destructive: dibuat versi baru berisi salinan versi target —
+    riwayat lama tetap utuh. Hanya pemilik objek yang bisa me-restore."""
+    token, _ = get_token_and_key()
+    if not token:
+        return
+    try:
+        resp = requests.post(
+            f"{API_BASE}/objects/{object_id}/versions/{version_id}/restore",
+            headers=_get_headers(token)
+        )
+        if resp.status_code == 200:
+            body = resp.json()
+            print(body["detail"])
+            print(f"  Versi baru    : v{body['version']} ({body['version_id']})")
+            print(f"  Restored from : {body['restored_from']}")
+        else:
+            print(f"Gagal: {resp.json().get('detail', resp.text)}")
+    except requests.ConnectionError:
+        print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
+
 
 if __name__ == "__main__":
     app()

@@ -41,6 +41,13 @@ class DatabaseManager:
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_objects_bucket ON objects(bucket_id)")
         except sqlite3.OperationalError:
             pass
+        # Kolom flag versi aktif pada tabel objects (untuk DB lama tanpa versioning).
+        try:
+            self.conn.execute(
+                "ALTER TABLE objects ADD COLUMN current_version_id TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # kolom sudah ada, lewati
         self.conn.commit()
         self.conn.execute("PRAGMA foreign_keys = ON")
 
@@ -56,6 +63,8 @@ class DatabaseManager:
         cols = [r[1] for r in self.conn.execute("PRAGMA table_info(objects)").fetchall()]
         if "bucket_id" in cols:
             return  # sudah bermigrasi
+        # current_version_id hanya ada di schema baru; jangan ikut terbawa
+        cols = [c for c in cols if c != "current_version_id"]
         legacy_select = ", ".join(
             c for c in ("id", "owner_id", "filename", "size", "mime_type",
                         "encrypted_payload", "iv", "nonce", "created_at",
@@ -135,7 +144,11 @@ class DatabaseManager:
             return False
     
     def get_object_by_id(self, obj_id: str) -> Optional[sqlite3.Row]:
-        cur = self.conn.execute("SELECT * FROM objects WHERE id = ?", (obj_id,))
+        # Sertakan kolom `version` dari versi current (flag versioning nyata).
+        cur = self.conn.execute(
+            "SELECT o.*, COALESCE(cv.version, 1) AS version FROM objects o "
+            "LEFT JOIN object_versions cv ON cv.object_id = o.id AND cv.is_current = 1 "
+            "WHERE o.id = ?", (obj_id,))
         return cur.fetchone()
     
     def get_objects_by_owner(self, owner_id: str) -> List[sqlite3.Row]:
@@ -171,21 +184,26 @@ class DatabaseManager:
         Jika bucket_id diberikan, filter hanya objek pada bucket tersebut."""
         # Bangun subquery secara eksplisit agar urutan binding mudah dibaca
         subs, params = [], []
+        # Snapshot versi current untuk kolom `version` + flag current_version_id
+        cv_join = ("LEFT JOIN object_versions cv ON cv.object_id = objects.id"
+                   " AND cv.is_current = 1")
         if bucket_id is not None:
-            subs.append("SELECT * FROM objects WHERE owner_id = ? AND bucket_id = ?")
+            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE owner_id = ? AND bucket_id = ?")
             params += [user_id, bucket_id]
-            subs.append("SELECT * FROM objects WHERE is_public = 1 AND bucket_id = ?")
+            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE is_public = 1 AND bucket_id = ?")
             params += [bucket_id]
             subs.append(
-                "SELECT o.* FROM objects o JOIN acl a ON o.id = a.object_id"
-                " WHERE a.user_id = ? AND o.bucket_id = ?"
+                f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
+                f"JOIN acl a ON objects.id = a.object_id {cv_join}"
+                " WHERE a.user_id = ? AND objects.bucket_id = ?"
             )
             params += [user_id, bucket_id]
         else:
-            subs.append("SELECT * FROM objects WHERE owner_id = ?")
+            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE owner_id = ?")
             params.append(user_id)
-            subs.append("SELECT * FROM objects WHERE is_public = 1")
-            subs.append("SELECT o.* FROM objects o JOIN acl a ON o.id = a.object_id WHERE a.user_id = ?")
+            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE is_public = 1")
+            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
+                        f"JOIN acl a ON objects.id = a.object_id {cv_join} WHERE a.user_id = ?")
             params.append(user_id)
         sql = "SELECT * FROM (" + " UNION ".join(subs) + ") ORDER BY created_at DESC"
         cur = self.conn.execute(sql, tuple(params))
@@ -210,23 +228,36 @@ class DatabaseManager:
         # Cari sebagai nama file pada objek yang bisa diakses user di bucket ini
         subs, params = [], []
         if bucket_id is not None:
-            subs.append("SELECT * FROM objects WHERE owner_id = ? AND bucket_id = ?")
+            subs.append("SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
+                        "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
+                        "WHERE owner_id = ? AND bucket_id = ?")
             params += [user_id, bucket_id]
-            subs.append("SELECT * FROM objects WHERE is_public = 1 AND bucket_id = ?")
+            subs.append("SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
+                        "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
+                        "WHERE is_public = 1 AND bucket_id = ?")
             params += [bucket_id]
             subs.append(
-                "SELECT o.* FROM objects o JOIN acl a ON o.id = a.object_id"
-                " WHERE a.user_id = ? AND o.bucket_id = ?"
+                "SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
+                "JOIN acl a ON objects.id = a.object_id "
+                "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
+                "WHERE a.user_id = ? AND objects.bucket_id = ?"
             )
             params += [user_id, bucket_id]
         else:
-            subs.append("SELECT * FROM objects WHERE owner_id = ?")
+            subs.append("SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
+                        "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
+                        "WHERE owner_id = ?")
             params.append(user_id)
-            subs.append("SELECT * FROM objects WHERE is_public = 1")
-            subs.append("SELECT o.* FROM objects o JOIN acl a ON o.id = a.object_id WHERE a.user_id = ?")
+            subs.append("SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
+                        "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
+                        "WHERE is_public = 1")
+            subs.append("SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
+                        "JOIN acl a ON objects.id = a.object_id "
+                        "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
+                        "WHERE a.user_id = ?")
             params.append(user_id)
         params.append(identifier)
-        sql = ("SELECT * FROM (" + " UNION ".join(subs) + ") WHERE filename = ?"
+        sql = ("SELECT * FROM (" + " UNION ".join(subs) + ") AS t WHERE filename = ?"
                " ORDER BY created_at DESC LIMIT 1")
         cur = self.conn.execute(sql, tuple(params))
         return cur.fetchone()
@@ -321,6 +352,89 @@ class DatabaseManager:
         cur = self.conn.execute("DELETE FROM object_keys WHERE object_id = ?", (object_id,))
         self.conn.commit()
         return cur.rowcount
+
+    # ==================== OBJECT VERSIONS (versioning nyata) ====================
+    def find_object_for_versioning(self, owner_id: str, filename: str,
+                                   bucket_id: str = None) -> Optional[sqlite3.Row]:
+        """Cari objek existing milik owner dengan nama & bucket yang sama.
+        Dipakai untuk auto-versioning: upload ulang = versi baru objek yang sama."""
+        if bucket_id is None:
+            cur = self.conn.execute(
+                "SELECT * FROM objects WHERE owner_id = ? AND filename = ? AND bucket_id IS NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (owner_id, filename)
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT * FROM objects WHERE owner_id = ? AND filename = ? AND bucket_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (owner_id, filename, bucket_id)
+            )
+        return cur.fetchone()
+
+    def next_version_number(self, object_id: str) -> int:
+        cur = self.conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS maxv FROM object_versions WHERE object_id = ?",
+            (object_id,)
+        )
+        row = cur.fetchone()
+        return (row["maxv"] if row else 0) + 1
+
+    def create_object_version(self, version_id: str, object_id: str, version: int,
+                              filename: str, mime_type: str, size: int,
+                              encrypted_payload: str, nonce: str,
+                              created_at: str, created_by: str,
+                              storage_line: int = None) -> bool:
+        try:
+            self.conn.execute(
+                """INSERT INTO object_versions
+                   (version_id, object_id, version, filename, mime_type, size,
+                    encrypted_payload, nonce, created_at, created_by, is_current, storage_line)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+                (version_id, object_id, version, filename, mime_type, size,
+                 encrypted_payload, nonce, created_at, created_by, storage_line)
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def set_current_version(self, object_id: str, version_id: str) -> bool:
+        """Pindahkan flag is_current ke satu versi, dan update pointer objects.current_version_id."""
+        self.conn.execute("UPDATE object_versions SET is_current = 0 WHERE object_id = ?", (object_id,))
+        cur = self.conn.execute("UPDATE object_versions SET is_current = 1 WHERE version_id = ?", (version_id,))
+        self.conn.execute("UPDATE objects SET current_version_id = ? WHERE id = ?", (version_id, object_id))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def get_object_version(self, version_id: str) -> Optional[sqlite3.Row]:
+        cur = self.conn.execute("SELECT * FROM object_versions WHERE version_id = ?", (version_id,))
+        return cur.fetchone()
+
+    def list_object_versions(self, object_id: str) -> List[sqlite3.Row]:
+        cur = self.conn.execute(
+            "SELECT * FROM object_versions WHERE object_id = ? ORDER BY version DESC",
+            (object_id,)
+        )
+        return cur.fetchall()
+
+    def count_object_versions(self, object_id: str) -> int:
+        cur = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM object_versions WHERE object_id = ?", (object_id,)
+        )
+        row = cur.fetchone()
+        return row["cnt"] if row else 0
+
+    def update_object_payload(self, obj_id: str, encrypted_payload: str, nonce: str,
+                              size: int, mime_type: str, updated_at: str,
+                              storage_line: int = None):
+        """Update baris objects agar selalu mencerminkan versi current."""
+        self.conn.execute(
+            """UPDATE objects SET encrypted_payload = ?, nonce = ?, size = ?,
+               mime_type = ?, updated_at = ?, storage_line = ? WHERE id = ?""",
+            (encrypted_payload, nonce, size, mime_type, updated_at, storage_line, obj_id)
+        )
+        self.conn.commit()
 
     # ==================== ACL ====================
     def set_acl(self, object_id: str, user_id: str, permission: str = "read") -> bool:

@@ -16,6 +16,7 @@ CloudSim adalah simulator penyimpanan cloud berbasis Python yang meniru perilaku
 - **Client-side Encryption** – File dienkripsi di sisi client sebelum dikirim ke server; server tidak pernah melihat plaintext.
 - **Basis Data Metadata** – SQLite untuk menyimpan metadata objek, pengguna, dan ACL.
 - **Append-only Storage** – Log immutable di `storage.txt` untuk mendukung versioning dan audit.
+- **Versioning Nyata per Objek** – Setiap versi punya flag `version_id` (`ver-...`) sendiri; upload ulang nama+bucket yang sama menambah versi baru (bukan menimpa), riwayat lama dapat diunduh, dan versi lama bisa di-*restore* secara non-destructive.
 
 
 ## Arsitektur
@@ -144,7 +145,28 @@ python -m cloudsim.cli.cli revoke <object_id> <username>
 
 # Hapus objek (hanya owner)
 python -m cloudsim.cli.cli delete <object_id>
+
+# Daftar seluruh versi objek (flag current menunjukkan versi aktif)
+python -m cloudsim.cli.cli versions <object_id>
+
+# Unduh versi tertentu (versi lama immutable & tetap tersedia)
+python -m cloudsim.cli.cli download <object_id> --version-id ver-abc123... -o lama.txt
+
+# Restore versi lama menjadi versi aktif (dibuat versi baru; riwayat utuh)
+python -m cloudsim.cli.cli restore <object_id> ver-abc123...
 ```
+
+### Versioning Nyata per Objek
+
+CloudSim kini menerapkan versioning nyata (mirip Google Cloud Storage):
+
+1. **Flag `version_id`** – Setiap kali objek dibuat/di-update, sistem membuat record versi dengan ID unik `ver-{12 hex}` di tabel `object_versions`; kolom `objects.current_version_id` menunjuk versi aktif.
+2. **Auto-versioning** – Upload ulang dengan `(owner, filename, bucket)` yang sama TIDAK menimpa data lama: nomor versi naik (v1 → v2 → …), snapshot ciphertext tiap versi disimpan immutable di DB maupun log append-only `storage.txt`.
+3. **List & unduh riwayat** – `GET /objects/{id}/versions`, `GET /objects/{id}/versions/{vid}`, dan `GET /objects/{id}/download?version_id=ver-...` mengembalikan versi tertentu; tanpa parameter tetap melayani versi current (kompatibel).
+4. **Restore versi lama** – `POST /objects/{id}/versions/{vid}/restore` (CLI: `restore`) menyalin versi target menjadi versi BARU lalu menandainya current — non-destructive, hanya owner.
+5. **Cascade** – Menghapus objek ikut menghapus seluruh versinya (`ON DELETE CASCADE`).
+
+Skema lama dimigrasi otomatis: tabel `object_versions` dibuat saat startup dan kolom `current_version_id` ditambahkan via `ALTER TABLE`.
 
 ### Re-encryption saat Sharing (Key-Wrapping + PBKDF2)
 
@@ -253,6 +275,7 @@ Pengujian mencakup:
 - Siklus hidup bucket lengkap (`mb`, `ls`, `cp`, `stat`, `rm`, `rb` via URI `gs://`)
 - Objek tanpa bucket (mode legacy) masih berfungsi
 - Validasi penolakan nama bucket tidak valid
+- **Versioning nyata** (`tests/test_versioning.py`, `class TestObjectVersioning`): flag `version_id` di metadata/list, auto-versioning saat upload ulang nama+bucket sama, daftar versi dengan flag current, unduh versi lama (immutable), restore non-destructive menjadi versi baru, hanya owner yang boleh restore (403), versioning ter-scope bucket, dan cascade penghapusan seluruh versi saat objek dihapus.
 - **Re-encryption share**: roundtrip wrap/unwrap DEK, determinisme PBKDF2, alur penuh owner→penerima (passphrase benar mendekripsi, passphrase salah menghasilkan sampah), kompatibilitas mundur mode `--no-reencrypt`, validasi 422 untuk `dek_wrapping` tidak valid, dan cascade penghapusan wrapped key saat objek dihapus (`class TestReEncryptionShare`)
 
 > Catatan: `pytest.ini` menonaktifkan plugin pihak ketiga yang bermasalah (`-p no:libtmux`) agar koleksi tes tidak crash di lingkungan tertentu. File data `cloudsim/storage/storage.txt` bersifat append-only — setiap run tes menambahkan baris ciphertext baru (perilaku yang memang dirancang).
@@ -301,7 +324,8 @@ Pengujian mencakup:
 │       └── storage_manager.py
 └── tests/                 # Pengujian
     ├── conftest.py        # Fixture isolasi DB in-memory & JWT secret
-    └── test_e2e.py
+    ├── test_e2e.py          # Skenario dasar, bucket, re-encryption share
+    └── test_versioning.py     # Versioning nyata: versi baru, list/download per versi, restore
 ```
 
 ## Keamanan & Catatan Penting

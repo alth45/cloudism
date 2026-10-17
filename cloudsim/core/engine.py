@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from cloudsim.core.id_generator import generate_object_id, generate_bucket_id
+from cloudsim.core.id_generator import generate_object_id, generate_bucket_id, generate_version_id
 from cloudsim.core.acl import acl as acl_manager
 from cloudsim.db.database import db
 from cloudsim.storage.storage_manager import StorageManager
@@ -24,28 +24,40 @@ class CloudObjectManager:
         Jika bucket_id diberikan, kaitkan objek ke bucket tersebut.
         Jika dek_wrapping diberikan (hasil wrap_key DEK untuk owner),
         simpan pula kunci ter-bungkusnya agar objek mendukung re-encryption
-        saat sharing."""
-        obj_id = generate_object_id()
+        saat sharing.
+
+        VERSIONING NYATA: jika sudah ada objek milik owner dengan nama file
+        yang sama pada bucket yang sama, upload ini menjadi VERSI BARU pada
+        objek yang sama (nomor versi naik, `version_id` baru dibuat, dan
+        menjadi versi current). Objek lama tidak ditimpa — setiap versi
+        tersimpan immutable di tabel object_versions + storage.txt.
+        """
         created_at = datetime.now(timezone.utc).isoformat()
         payload_size = len(encrypted_payload.encode('utf-8'))  # ukuran base64 string
 
-        # Tulis ke database
-        success = db.create_object(
-            obj_id=obj_id,
-            owner_id=owner_id,
-            filename=filename,
-            size=payload_size,
-            mime_type=mime_type,
-            encrypted_payload=encrypted_payload,
-            iv="",          # mode CTR tidak butuh IV terpisah, nonce sudah cukup
-            nonce=nonce,
-            created_at=created_at,
-            bucket_id=bucket_id
-        )
-        if not success:
-            raise Exception("Gagal menyimpan ke database")
+        existing = db.find_object_for_versioning(owner_id, filename, bucket_id)
+        if existing:
+            obj_id = existing["id"]
+            version_no = db.next_version_number(obj_id)
+        else:
+            obj_id = generate_object_id()
+            version_no = 1
+            success = db.create_object(
+                obj_id=obj_id,
+                owner_id=owner_id,
+                filename=filename,
+                size=payload_size,
+                mime_type=mime_type,
+                encrypted_payload=encrypted_payload,
+                iv="",          # mode CTR tidak butuh IV terpisah, nonce sudah cukup
+                nonce=nonce,
+                created_at=created_at,
+                bucket_id=bucket_id
+            )
+            if not success:
+                raise Exception("Gagal menyimpan ke database")
 
-        # Tulis ke storage.txt (append-only)
+        # Tulis ke storage.txt (append-only) — satu baris per versi, immutable
         record = {
             "id": obj_id,
             "owner": owner_id,
@@ -55,13 +67,44 @@ class CloudObjectManager:
             "nonce": nonce,
             "created_at": created_at,
             "bucket_id": bucket_id,
+            "version": version_no,
             "deleted": False
         }
         line = self.storage.append_record(record)
 
-        # Update storage_line di database
-        db.conn.execute("UPDATE objects SET storage_line = ? WHERE id = ?", (line, obj_id))
-        db.conn.commit()
+        if existing:
+            # Update baris objects agar mencerminkan versi terbaru
+            db.update_object_payload(
+                obj_id=obj_id,
+                encrypted_payload=encrypted_payload,
+                nonce=nonce,
+                size=payload_size,
+                mime_type=mime_type,
+                updated_at=created_at,
+                storage_line=line,
+            )
+        else:
+            db.conn.execute("UPDATE objects SET storage_line = ? WHERE id = ?", (line, obj_id))
+            db.conn.commit()
+
+        # Buat rekaman versi baru + flag current
+        version_id = generate_version_id()
+        ok = db.create_object_version(
+            version_id=version_id,
+            object_id=obj_id,
+            version=version_no,
+            filename=filename,
+            mime_type=mime_type,
+            size=payload_size,
+            encrypted_payload=encrypted_payload,
+            nonce=nonce,
+            created_at=created_at,
+            created_by=owner_id,
+            storage_line=line,
+        )
+        if not ok:
+            raise Exception("Gagal menyimpan versi objek")
+        db.set_current_version(obj_id, version_id)
 
         # Set ACL owner
         acl_manager.set_owner(obj_id, owner_id)
@@ -85,23 +128,42 @@ class CloudObjectManager:
             "size": payload_size,
             "mime_type": mime_type,
             "created_at": created_at,
-            "version": 1,
+            "version": version_no,
+            "version_id": version_id,
             "bucket_id": bucket_id
         }
 
-    def download_encrypted(self, object_id: str, user_id: str) -> Optional[dict]:
-        """Dapatkan data terenkripsi untuk didownload (setelah cek akses)."""
+    def download_encrypted(self, object_id: str, user_id: str,
+                           version_id: str = None) -> Optional[dict]:
+        """Dapatkan data terenkripsi untuk didownload (setelah cek akses).
+
+        Jika `version_id` diberikan, kembalikan snapshot versi tersebut
+        (versi lama tetap bisa diunduh — sifat immutable dari versioning).
+        Tanpa version_id, kembalikan versi current."""
         if not db.check_access(object_id, user_id, "read"):
             return None
         obj = db.get_object_by_id(object_id)
         if not obj:
             return None
+        if version_id is not None:
+            ver = db.get_object_version(version_id)
+            if not ver or ver["object_id"] != object_id:
+                return None
+            payload = ver["encrypted_payload"]
+            nonce_v = ver["nonce"]
+            mime = ver["mime_type"]
+        else:
+            payload = obj["encrypted_payload"]
+            nonce_v = obj["nonce"]
+            mime = obj["mime_type"]
         result = {
-            "encrypted_payload": obj["encrypted_payload"],
-            "nonce": obj["nonce"],
+            "encrypted_payload": payload,
+            "nonce": nonce_v,
             "filename": obj["filename"],
-            "mime_type": obj["mime_type"]
+            "mime_type": mime
         }
+        if version_id is not None:
+            result["version_id"] = version_id
         # Sertakan wrapped DEK untuk pengguna ini bila ada (alur re-encryption).
         key_row = db.get_object_key(object_id, user_id)
         if key_row:
@@ -196,6 +258,9 @@ class CloudObjectManager:
         rows = db.list_accessible_objects(user_id, bucket_id)
         result = []
         for r in rows:
+            keys = r.keys()
+            version = r["version"] if "version" in keys else 1
+            ver_id = r["current_version_id"] if "current_version_id" in keys else None
             result.append({
                 "id": r["id"],
                 "owner": r["owner_id"],
@@ -203,8 +268,9 @@ class CloudObjectManager:
                 "size": r["size"],
                 "mime_type": r["mime_type"],
                 "created_at": r["created_at"],
-                "version": 1,
-                "bucket_id": r["bucket_id"] if "bucket_id" in r.keys() else None
+                "version": version,
+                "version_id": ver_id,
+                "bucket_id": r["bucket_id"] if "bucket_id" in keys else None
             })
         return result
 
@@ -215,6 +281,7 @@ class CloudObjectManager:
         obj = db.get_object_by_id(object_id)
         if not obj:
             return None
+        keys = obj.keys()
         return {
             "id": obj["id"],
             "owner": obj["owner_id"],
@@ -222,8 +289,116 @@ class CloudObjectManager:
             "size": obj["size"],
             "mime_type": obj["mime_type"],
             "created_at": obj["created_at"],
-            "version": 1,
-            "bucket_id": obj["bucket_id"] if "bucket_id" in obj.keys() else None
+            "version": obj["version"] if "version" in keys else 1,
+            "version_id": obj["current_version_id"] if "current_version_id" in keys else None,
+            "bucket_id": obj["bucket_id"] if "bucket_id" in keys else None
+        }
+
+    # ==================== OBJECT VERSIONING (nyata, per objek) ====================
+    def list_versions(self, object_id: str, user_id: str) -> Optional[list]:
+        """Daftar seluruh versi sebuah objek (termasuk flag `current`).
+        Mengembalikan None jika objek tidak ada / akses ditolak."""
+        if not db.check_access(object_id, user_id, "read"):
+            return None
+        if not db.get_object_by_id(object_id):
+            return None
+        out = []
+        for v in db.list_object_versions(object_id):
+            out.append({
+                "version_id": v["version_id"],
+                "object_id": v["object_id"],
+                "version": v["version"],
+                "filename": v["filename"],
+                "mime_type": v["mime_type"],
+                "size": v["size"],
+                "created_at": v["created_at"],
+                "created_by": v["created_by"],
+                "current": bool(v["is_current"]),
+            })
+        return out
+
+    def get_version(self, object_id: str, user_id: str, version_id: str) -> Optional[dict]:
+        """Metadata satu versi tertentu (tanpa payload)."""
+        if not db.check_access(object_id, user_id, "read"):
+            return None
+        v = db.get_object_version(version_id)
+        if not v or v["object_id"] != object_id:
+            return None
+        return {
+            "version_id": v["version_id"],
+            "object_id": v["object_id"],
+            "version": v["version"],
+            "filename": v["filename"],
+            "mime_type": v["mime_type"],
+            "size": v["size"],
+            "created_at": v["created_at"],
+            "created_by": v["created_by"],
+            "current": bool(v["is_current"]),
+        }
+
+    def restore_version(self, object_id: str, user_id: str, version_id: str) -> Optional[dict]:
+        """Restore versi lama menjadi versi aktif.
+
+        Sifatnya NON-DESTRUCTIVE (mirip GCS): versi target di-snapshot ulang
+        sebagai versi BARU dengan version_id baru, lalu ditandai current.
+        Semua riwayat lama tetap utuh. Hanya owner yang boleh me-restore."""
+        obj = db.get_object_by_id(object_id)
+        if not obj or obj["owner_id"] != user_id:
+            return None
+        v = db.get_object_version(version_id)
+        if not v or v["object_id"] != object_id:
+            return None
+        created_at = datetime.now(timezone.utc).isoformat()
+        new_no = db.next_version_number(object_id)
+        new_vid = generate_version_id()
+
+        record = {
+            "id": object_id,
+            "owner": obj["owner_id"],
+            "filename": v["filename"],
+            "mime_type": v["mime_type"],
+            "encrypted_payload": v["encrypted_payload"],
+            "nonce": v["nonce"],
+            "created_at": created_at,
+            "bucket_id": obj["bucket_id"] if "bucket_id" in obj.keys() else None,
+            "version": new_no,
+            "restored_from": version_id,
+            "deleted": False
+        }
+        line = self.storage.append_record(record)
+
+        ok = db.create_object_version(
+            version_id=new_vid,
+            object_id=object_id,
+            version=new_no,
+            filename=v["filename"],
+            mime_type=v["mime_type"],
+            size=v["size"],
+            encrypted_payload=v["encrypted_payload"],
+            nonce=v["nonce"],
+            created_at=created_at,
+            created_by=user_id,
+            storage_line=line,
+        )
+        if not ok:
+            return None
+        # Versi restored menjadi current; baris objects mengikuti versi current
+        db.set_current_version(object_id, new_vid)
+        db.update_object_payload(
+            obj_id=object_id,
+            encrypted_payload=v["encrypted_payload"],
+            nonce=v["nonce"],
+            size=v["size"],
+            mime_type=v["mime_type"],
+            updated_at=created_at,
+            storage_line=line,
+        )
+        return {
+            "id": object_id,
+            "version": new_no,
+            "version_id": new_vid,
+            "restored_from": version_id,
+            "created_at": created_at,
         }
 
     # ==================== BUCKET MANAGEMENT ====================
@@ -299,7 +474,8 @@ class CloudObjectManager:
             "size": obj["size"],
             "mime_type": obj["mime_type"],
             "created_at": obj["created_at"],
-            "version": 1,
+            "version": obj["version"] if "version" in obj.keys() else 1,
+            "version_id": obj["current_version_id"] if "current_version_id" in obj.keys() else None,
             "bucket_id": obj["bucket_id"],
             "bucket_name": bucket["name"]
         }
