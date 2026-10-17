@@ -194,5 +194,27 @@ class CloudObjectManager:
         bucket = db.get_bucket_by_id(bucket_id)
         if not bucket or bucket["owner_id"] != owner_id:
             return False
-        # Delewakan ke db.delete_bucket yang akan mengecek kekosongan
+        # Delegasikan ke db.delete_bucket yang akan mengecek kekosongan
         return db.delete_bucket(bucket_id, owner_id)
+
+    def resolve_object(self, user_id: str, bucket_name: str, identifier: str) -> Optional[dict]:
+        """Resolve path gs://bucket/identifier menjadi objek yang bisa diakses user.
+        Identifier bisa berupa ID objek (obj-...) atau nama file di dalam bucket.
+        Mengembalikan metadata objek + bucket_name, atau None jika tidak ditemukan."""
+        bucket = db.get_bucket_by_name(bucket_name)
+        if not bucket:
+            return None
+        obj = db.find_accessible_object_by_name(user_id, bucket["id"], identifier)
+        if not obj:
+            return None
+        return {
+            "id": obj["id"],
+            "owner": obj["owner_id"],
+            "filename": obj["filename"],
+            "size": obj["size"],
+            "mime_type": obj["mime_type"],
+            "created_at": obj["created_at"],
+            "version": 1,
+            "bucket_id": obj["bucket_id"],
+            "bucket_name": bucket["name"]
+        }
