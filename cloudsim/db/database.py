@@ -1,6 +1,21 @@
 import sqlite3
 import os
+from datetime import datetime, timezone
 from typing import Optional, List, Tuple
+
+# Retensi default soft-delete di trash (hari). Bisa dioverride lewat env
+# CLOUDSIM_TRASH_RETENTION_DAYS agar pengujian/tuning lebih fleksibel.
+DEFAULT_TRASH_RETENTION_DAYS = 30
+
+
+def get_trash_retention_days() -> int:
+    """Baca konfigurasi retensi trash dari environment variable."""
+    raw = os.environ.get("CLOUDSIM_TRASH_RETENTION_DAYS")
+    try:
+        days = int(raw) if raw not in (None, "") else DEFAULT_TRASH_RETENTION_DAYS
+    except ValueError:
+        days = DEFAULT_TRASH_RETENTION_DAYS
+    return days if days > 0 else DEFAULT_TRASH_RETENTION_DAYS
 
 class DatabaseManager:
     """Mengelola koneksi dan operasi database SQLite."""
@@ -48,6 +63,20 @@ class DatabaseManager:
             )
         except sqlite3.OperationalError:
             pass  # kolom sudah ada, lewati
+        # Kolom soft-delete & trash (untuk DB lama sebelum fitur trash ada).
+        for col_sql in (
+            "ALTER TABLE objects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+            "ALTER TABLE objects ADD COLUMN trashed_at TEXT",
+            "ALTER TABLE objects ADD COLUMN purge_after TEXT",
+        ):
+            try:
+                self.conn.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass  # kolom sudah ada, lewati
+        try:
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_objects_status ON objects(status)")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
         self.conn.execute("PRAGMA foreign_keys = ON")
 
@@ -152,11 +181,11 @@ class DatabaseManager:
         return cur.fetchone()
     
     def get_objects_by_owner(self, owner_id: str) -> List[sqlite3.Row]:
-        cur = self.conn.execute("SELECT * FROM objects WHERE owner_id = ? ORDER BY created_at DESC", (owner_id,))
+        cur = self.conn.execute("SELECT * FROM objects WHERE owner_id = ? AND status = 'active' ORDER BY created_at DESC", (owner_id,))
         return cur.fetchall()
     
     def get_public_objects(self) -> List[sqlite3.Row]:
-        cur = self.conn.execute("SELECT * FROM objects WHERE is_public = 1 ORDER BY created_at DESC")
+        cur = self.conn.execute("SELECT * FROM objects WHERE is_public = 1 AND status = 'active' ORDER BY created_at DESC")
         return cur.fetchall()
     
     def get_objects_shared_with(self, user_id: str) -> List[sqlite3.Row]:
@@ -164,7 +193,7 @@ class DatabaseManager:
         cur = self.conn.execute(
             """SELECT o.* FROM objects o 
                JOIN acl a ON o.id = a.object_id 
-               WHERE a.user_id = ? 
+               WHERE a.user_id = ? AND o.status = 'active'
                ORDER BY o.created_at DESC""",
             (user_id,)
         )
@@ -179,6 +208,77 @@ class DatabaseManager:
         self.conn.commit()
         return cur.rowcount > 0
 
+    # ==================== SOFT DELETE & TRASH ====================
+    def mark_object_trashed(self, obj_id: str, trashed_at: str, purge_after: str) -> bool:
+        """Soft delete: tandai objek masuk trash beserta batas retensinya.
+        Hanya berhasil untuk objek yang masih 'active'."""
+        cur = self.conn.execute(
+            "UPDATE objects SET status = 'trashed', trashed_at = ?, purge_after = ? "
+            "WHERE id = ? AND status = 'active'",
+            (trashed_at, purge_after, obj_id)
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def restore_object_from_trash(self, obj_id: str) -> bool:
+        """Keluarkan objek dari trash kembali menjadi 'active'."""
+        cur = self.conn.execute(
+            "UPDATE objects SET status = 'active', trashed_at = NULL, purge_after = NULL "
+            "WHERE id = ? AND status = 'trashed'",
+            (obj_id,)
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def list_trashed_objects(self, user_id: str, bucket_id: str = None) -> List[sqlite3.Row]:
+        """Daftar objek di trash milik user (hanya owner; sharee/publik tidak melihat trash)."""
+        if bucket_id is not None:
+            cur = self.conn.execute(
+                "SELECT o.*, COALESCE(cv.version, 1) AS version FROM objects o "
+                "LEFT JOIN object_versions cv ON cv.object_id = o.id AND cv.is_current = 1 "
+                "WHERE o.owner_id = ? AND o.status = 'trashed' AND o.bucket_id = ? "
+                "ORDER BY o.trashed_at DESC",
+                (user_id, bucket_id)
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT o.*, COALESCE(cv.version, 1) AS version FROM objects o "
+                "LEFT JOIN object_versions cv ON cv.object_id = o.id AND cv.is_current = 1 "
+                "WHERE o.owner_id = ? AND o.status = 'trashed' "
+                "ORDER BY o.trashed_at DESC",
+                (user_id,)
+            )
+        return cur.fetchall()
+
+    def count_trashed_objects(self, user_id: str) -> int:
+        cur = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM objects WHERE owner_id = ? AND status = 'trashed'",
+            (user_id,)
+        )
+        row = cur.fetchone()
+        return row["cnt"] if row else 0
+
+    def empty_trash(self, user_id: str) -> int:
+        """Hapus permanen seluruh objek di trash milik user. Mengembalikan jumlah terhapus."""
+        ids = [r["id"] for r in self.conn.execute(
+            "SELECT id FROM objects WHERE owner_id = ? AND status = 'trashed'", (user_id,)
+        ).fetchall()]
+        n = 0
+        for oid in ids:
+            cur = self.conn.execute("DELETE FROM objects WHERE id = ?", (oid,))
+            n += cur.rowcount
+        self.conn.commit()
+        return n
+
+    def get_expired_trash_ids(self, now_iso: str) -> List[str]:
+        """ID objek di trash yang batas retensinya sudah lewat (siap di-purge otomatis)."""
+        cur = self.conn.execute(
+            "SELECT id FROM objects WHERE status = 'trashed' "
+            "AND purge_after IS NOT NULL AND purge_after <= ?",
+            (now_iso,)
+        )
+        return [r["id"] for r in cur.fetchall()]
+
     def list_accessible_objects(self, user_id: str, bucket_id: str = None) -> List[sqlite3.Row]:
         """Gabungan milik sendiri, publik, dan yang di-share.
         Jika bucket_id diberikan, filter hanya objek pada bucket tersebut."""
@@ -188,22 +288,22 @@ class DatabaseManager:
         cv_join = ("LEFT JOIN object_versions cv ON cv.object_id = objects.id"
                    " AND cv.is_current = 1")
         if bucket_id is not None:
-            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE owner_id = ? AND bucket_id = ?")
+            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE owner_id = ? AND status = 'active' AND bucket_id = ?")
             params += [user_id, bucket_id]
-            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE is_public = 1 AND bucket_id = ?")
+            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE is_public = 1 AND status = 'active' AND bucket_id = ?")
             params += [bucket_id]
             subs.append(
                 f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
                 f"JOIN acl a ON objects.id = a.object_id {cv_join}"
-                " WHERE a.user_id = ? AND objects.bucket_id = ?"
+                " WHERE a.user_id = ? AND objects.status = 'active' AND objects.bucket_id = ?"
             )
             params += [user_id, bucket_id]
         else:
-            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE owner_id = ?")
+            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE owner_id = ? AND status = 'active'")
             params.append(user_id)
-            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE is_public = 1")
+            subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects {cv_join} WHERE is_public = 1 AND status = 'active'")
             subs.append(f"SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
-                        f"JOIN acl a ON objects.id = a.object_id {cv_join} WHERE a.user_id = ?")
+                        f"JOIN acl a ON objects.id = a.object_id {cv_join} WHERE a.user_id = ? AND objects.status = 'active'")
             params.append(user_id)
         sql = "SELECT * FROM (" + " UNION ".join(subs) + ") ORDER BY created_at DESC"
         cur = self.conn.execute(sql, tuple(params))
@@ -212,7 +312,7 @@ class DatabaseManager:
     def get_object_by_name_in_bucket(self, bucket_id: str, filename: str) -> Optional[sqlite3.Row]:
         """Cari objek berdasarkan nama file di dalam sebuah bucket (ambil terbaru)."""
         cur = self.conn.execute(
-            "SELECT * FROM objects WHERE bucket_id = ? AND filename = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM objects WHERE bucket_id = ? AND filename = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
             (bucket_id, filename)
         )
         return cur.fetchone()
@@ -230,31 +330,31 @@ class DatabaseManager:
         if bucket_id is not None:
             subs.append("SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
                         "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
-                        "WHERE owner_id = ? AND bucket_id = ?")
+                        "WHERE owner_id = ? AND status = 'active' AND bucket_id = ?")
             params += [user_id, bucket_id]
             subs.append("SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
                         "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
-                        "WHERE is_public = 1 AND bucket_id = ?")
+                        "WHERE is_public = 1 AND status = 'active' AND bucket_id = ?")
             params += [bucket_id]
             subs.append(
                 "SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
                 "JOIN acl a ON objects.id = a.object_id "
                 "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
-                "WHERE a.user_id = ? AND objects.bucket_id = ?"
+                "WHERE a.user_id = ? AND objects.status = 'active' AND objects.bucket_id = ?"
             )
             params += [user_id, bucket_id]
         else:
             subs.append("SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
                         "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
-                        "WHERE owner_id = ?")
+                        "WHERE owner_id = ? AND status = 'active'")
             params.append(user_id)
             subs.append("SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
                         "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
-                        "WHERE is_public = 1")
+                        "WHERE is_public = 1 AND status = 'active'")
             subs.append("SELECT objects.*, COALESCE(cv.version, 1) AS version FROM objects "
                         "JOIN acl a ON objects.id = a.object_id "
                         "LEFT JOIN object_versions cv ON cv.object_id = objects.id AND cv.is_current = 1 "
-                        "WHERE a.user_id = ?")
+                        "WHERE a.user_id = ? AND objects.status = 'active'")
             params.append(user_id)
         params.append(identifier)
         sql = ("SELECT * FROM (" + " UNION ".join(subs) + ") AS t WHERE filename = ?"
@@ -297,7 +397,7 @@ class DatabaseManager:
     def get_bucket_objects(self, bucket_id: str) -> List[sqlite3.Row]:
         """Daftar semua objek (yang visible) di dalam sebuah bucket."""
         cur = self.conn.execute(
-            "SELECT * FROM objects WHERE bucket_id = ? ORDER BY created_at DESC",
+            "SELECT * FROM objects WHERE bucket_id = ? AND status = 'active' ORDER BY created_at DESC",
             (bucket_id,)
         )
         return cur.fetchall()
@@ -360,13 +460,13 @@ class DatabaseManager:
         Dipakai untuk auto-versioning: upload ulang = versi baru objek yang sama."""
         if bucket_id is None:
             cur = self.conn.execute(
-                "SELECT * FROM objects WHERE owner_id = ? AND filename = ? AND bucket_id IS NULL "
+                "SELECT * FROM objects WHERE owner_id = ? AND filename = ? AND status = 'active' AND bucket_id IS NULL "
                 "ORDER BY created_at DESC LIMIT 1",
                 (owner_id, filename)
             )
         else:
             cur = self.conn.execute(
-                "SELECT * FROM objects WHERE owner_id = ? AND filename = ? AND bucket_id = ? "
+                "SELECT * FROM objects WHERE owner_id = ? AND filename = ? AND status = 'active' AND bucket_id = ? "
                 "ORDER BY created_at DESC LIMIT 1",
                 (owner_id, filename, bucket_id)
             )

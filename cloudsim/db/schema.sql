@@ -39,9 +39,16 @@ CREATE TABLE IF NOT EXISTS objects (
     -- 0 = private, 1 = public
     bucket_id TEXT,
     -- wadah logis (FK ke buckets.id; NULL = objek tanpa bucket)
+    status TEXT NOT NULL DEFAULT 'active',
+    -- 'active' | 'trashed' (soft delete; 'deleted' = hard delete langsung dari purge)
+    trashed_at TEXT,
+    -- ISO timestamp saat masuk trash (NULL jika belum pernah ditrash)
+    purge_after TEXT,
+    -- ISO timestamp batas retensi; setelah ini objek di-purge otomatis
     FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (bucket_id) REFERENCES buckets(id) ON DELETE SET NULL
 );
+CREATE INDEX IF NOT EXISTS idx_objects_status ON objects(status);
 CREATE TABLE IF NOT EXISTS acl (
     object_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
