@@ -18,9 +18,13 @@ class CloudObjectManager:
     def upload_encrypted(self, owner_id: str, filename: str,
                          encrypted_payload: str, nonce: str,
                          mime_type: str = "application/octet-stream",
-                         bucket_id: str = None) -> dict:
+                         bucket_id: str = None,
+                         dek_wrapping: dict = None) -> dict:
         """Simpan ciphertext yang sudah dienkripsi client.
-        Jika bucket_id diberikan, kaitkan objek ke bucket tersebut."""
+        Jika bucket_id diberikan, kaitkan objek ke bucket tersebut.
+        Jika dek_wrapping diberikan (hasil wrap_key DEK untuk owner),
+        simpan pula kunci ter-bungkusnya agar objek mendukung re-encryption
+        saat sharing."""
         obj_id = generate_object_id()
         created_at = datetime.now(timezone.utc).isoformat()
         payload_size = len(encrypted_payload.encode('utf-8'))  # ukuran base64 string
@@ -62,6 +66,18 @@ class CloudObjectManager:
         # Set ACL owner
         acl_manager.set_owner(obj_id, owner_id)
 
+        # Simpan wrapped DEK milik owner (untuk re-encryption saat sharing)
+        if dek_wrapping:
+            db.set_object_key(
+                object_id=obj_id,
+                user_id=owner_id,
+                wrapped_key=dek_wrapping["wrapped_key"],
+                wrap_nonce=dek_wrapping["wrap_nonce"],
+                wrap_salt=dek_wrapping["wrap_salt"],
+                iterations=int(dek_wrapping.get("iterations", 100000)),
+                created_at=created_at,
+            )
+
         return {
             "id": obj_id,
             "owner": owner_id,
@@ -80,12 +96,81 @@ class CloudObjectManager:
         obj = db.get_object_by_id(object_id)
         if not obj:
             return None
-        return {
+        result = {
             "encrypted_payload": obj["encrypted_payload"],
             "nonce": obj["nonce"],
             "filename": obj["filename"],
             "mime_type": obj["mime_type"]
         }
+        # Sertakan wrapped DEK untuk pengguna ini bila ada (alur re-encryption).
+        key_row = db.get_object_key(object_id, user_id)
+        if key_row:
+            result["wrapped_key"] = {
+                "wrapped_key": key_row["wrapped_key"],
+                "wrap_nonce": key_row["wrap_nonce"],
+                "wrap_salt": key_row["wrap_salt"],
+                "iterations": key_row["iterations"],
+            }
+        return result
+
+    def share_with_reencryption(self, object_id: str, owner_id: str, target_user_id: str,
+                                permission: str, dek_wrapping: dict) -> bool:
+        """Re-encryption saat sharing: simpan DEK yang sudah di-wrap ulang oleh
+        client owner memakai KEK turunan passphrase pembagian untuk penerima.
+
+        Payload ciphertext TIDAK diubah — yang di-re-encrypt adalah kunci datanya
+        (key-wrapping), sehingga server tetap tidak pernah melihat plaintext/DEK.
+        """
+        obj = db.get_object_by_id(object_id)
+        if not obj or obj["owner_id"] != owner_id:
+            return False
+        created_at = datetime.now(timezone.utc).isoformat()
+        ok = db.set_object_key(
+            object_id=object_id,
+            user_id=target_user_id,
+            wrapped_key=dek_wrapping["wrapped_key"],
+            wrap_nonce=dek_wrapping["wrap_nonce"],
+            wrap_salt=dek_wrapping["wrap_salt"],
+            iterations=int(dek_wrapping.get("iterations", 100000)),
+            created_at=created_at,
+        )
+        if not ok:
+            return False
+        db.set_acl(object_id, target_user_id, permission)
+        acl_manager.share_with(object_id, target_user_id, permission)
+        return True
+
+    def revoke_share(self, object_id: str, owner_id: str, target_user_id: str) -> bool:
+        """Cabut sharing: hapus ACL dan wrapped DEK milik penerima."""
+        obj = db.get_object_by_id(object_id)
+        if not obj or obj["owner_id"] != owner_id:
+            return False
+        db.remove_acl(object_id, target_user_id)
+        acl_manager.revoke_access(object_id, target_user_id)
+        # Ganti wrapped key penerima dengan versi ter-bungkus passphrase acak
+        # agar tidak bisa lagi membuka DEK lama? Cukup hapus barisnya.
+        cur = db.conn.execute(
+            "DELETE FROM object_keys WHERE object_id = ? AND user_id = ?",
+            (object_id, target_user_id)
+        )
+        db.conn.commit()
+        return cur.rowcount >= 0  # sukses meski tidak ada key yang terhapus
+
+    def list_shares(self, object_id: str, user_id: str) -> Optional[list]:
+        """Daftar pembagian objek: siapa saja yang memegang wrapped DEK."""
+        if not db.check_access(object_id, user_id, "read"):
+            return None
+        rows = db.list_object_keys(object_id)
+        result = []
+        for r in rows:
+            u = db.get_user_by_id(r["user_id"])
+            result.append({
+                "user_id": r["user_id"],
+                "username": u["username"] if u else "?",
+                "permission": db.get_acl(object_id, r["user_id"]) or "owner",
+                "created_at": r["created_at"],
+            })
+        return result
 
     def delete(self, object_id: str, user_id: str) -> bool:
         """Hapus objek (hanya owner). Menambah tombstone di storage."""
@@ -99,7 +184,7 @@ class CloudObjectManager:
             "deleted_at": datetime.now(timezone.utc).isoformat()
         }
         self.storage.append_record(tombstone)
-        # Hapus dari database
+        # Hapus dari database (wrapped keys ikut terhapus via ON DELETE CASCADE)
         db.delete_object(object_id)
         # Hapus ACL
         acl_manager.revoke_access(object_id, user_id)  # kurang lengkap, tapi ok

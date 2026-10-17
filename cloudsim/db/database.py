@@ -285,6 +285,43 @@ class DatabaseManager:
         return cur.rowcount > 0
 
     
+    # ==================== OBJECT KEYS (key-wrapping / re-encryption) ====================
+    def set_object_key(self, object_id: str, user_id: str, wrapped_key: str,
+                       wrap_nonce: str, wrap_salt: str, iterations: int,
+                       created_at: str) -> bool:
+        """Simpan/perbarui DEK ter-bungkus untuk satu pasangan (objek, pengguna)."""
+        try:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO object_keys
+                   (object_id, user_id, wrapped_key, wrap_nonce, wrap_salt, iterations, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (object_id, user_id, wrapped_key, wrap_nonce, wrap_salt, iterations, created_at)
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def get_object_key(self, object_id: str, user_id: str) -> Optional[sqlite3.Row]:
+        cur = self.conn.execute(
+            "SELECT * FROM object_keys WHERE object_id = ? AND user_id = ?",
+            (object_id, user_id)
+        )
+        return cur.fetchone()
+
+    def list_object_keys(self, object_id: str) -> List[sqlite3.Row]:
+        cur = self.conn.execute(
+            "SELECT * FROM object_keys WHERE object_id = ? ORDER BY created_at DESC",
+            (object_id,)
+        )
+        return cur.fetchall()
+
+    def delete_object_keys(self, object_id: str) -> int:
+        """Hapus semua wrapped key milik sebuah objek. Mengembalikan jumlah baris terhapus."""
+        cur = self.conn.execute("DELETE FROM object_keys WHERE object_id = ?", (object_id,))
+        self.conn.commit()
+        return cur.rowcount
+
     # ==================== ACL ====================
     def set_acl(self, object_id: str, user_id: str, permission: str = "read") -> bool:
         try:

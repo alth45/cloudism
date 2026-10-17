@@ -29,10 +29,23 @@ class UploadRequest(BaseModel):
     filename: str
     mime_type: str = "application/octet-stream"
     bucket_id: str | None = None  # opsional: kaitkan objek ke bucket
+    dek_wrapping: dict | None = None  # hasil key-wrapping DEK utk owner (re-encryption)
 
 class ShareRequest(BaseModel):
     username: str
     permission: str = "read"
+    dek_wrapping: dict | None = None  # hasil re-wrap DEK utk penerima (re-encryption)
+    # dek_wrapping = {"wrapped_key": b64, "wrap_nonce": b64, "wrap_salt": hex, "iterations": int}
+
+def _validate_wrapping(w: dict) -> dict:
+    """Validasi bentuk dek_wrapping yang dikirim client."""
+    required = ("wrapped_key", "wrap_nonce", "wrap_salt")
+    if not isinstance(w, dict) or any(k not in w for k in required):
+        raise HTTPException(
+            status_code=422,
+            detail="dek_wrapping tidak valid (butuh wrapped_key, wrap_nonce, wrap_salt)"
+        )
+    return w
 
 # ---------- List ----------
 @router.get("/", response_model=List[ObjectMetadataResponse])
@@ -48,13 +61,16 @@ def upload_object(req: UploadRequest, current_user: dict = Depends(get_current_u
         bucket = db.get_bucket_by_id(req.bucket_id)
         if not bucket or bucket["owner_id"] != current_user["id"]:
             raise HTTPException(status_code=404, detail="Bucket tidak ditemukan atau bukan milik Anda")
+    if req.dek_wrapping is not None:
+        _validate_wrapping(req.dek_wrapping)
     metadata = object_manager.upload_encrypted(
         owner_id=current_user["id"],
         filename=req.filename,
         encrypted_payload=req.encrypted_payload,
         nonce=req.nonce,
         mime_type=req.mime_type,
-        bucket_id=req.bucket_id
+        bucket_id=req.bucket_id,
+        dek_wrapping=req.dek_wrapping
     )
     return metadata
 
@@ -92,7 +108,13 @@ def share_object(
     share_req: ShareRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """Bagikan akses objek ke pengguna lain."""
+    """Bagikan akses objek ke pengguna lain.
+
+    Jika `dek_wrapping` disertakan (dihasilkan client dari re-encryption
+    key-wrapping/PBKDF2), DEK objek dibungkus ulang dengan KEK turunan
+    passphrase pembagian sehingga penerima dapat mendekripsi isinya.
+    Tanpa `dek_wrapping`, hanya metadata+ciphertext yang dibagikan (mode lama).
+    """
     meta = object_manager.get_metadata(object_id, current_user["id"])
     if not meta or meta["owner"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Hanya pemilik yang bisa membagikan objek")
@@ -100,7 +122,50 @@ def share_object(
     if not target_user:
         raise HTTPException(status_code=404, detail="User tujuan tidak ditemukan")
 
-    # Tambahkan ACL di database dan di memory
+    if share_req.dek_wrapping is not None:
+        _validate_wrapping(share_req.dek_wrapping)
+        ok = object_manager.share_with_reencryption(
+            object_id=object_id,
+            owner_id=current_user["id"],
+            target_user_id=target_user["id"],
+            permission=share_req.permission,
+            dek_wrapping=share_req.dek_wrapping,
+        )
+        if not ok:
+            raise HTTPException(status_code=500, detail="Gagal menyimpan wrapped key")
+        return {
+            "detail": f"Objek {object_id} dibagikan ke {share_req.username} "
+                      f"dengan izin {share_req.permission} (re-encryption: kunci di-wrap utk penerima)"
+        }
+
+    # Mode lama: tanpa re-encryption
     db.set_acl(object_id, target_user["id"], share_req.permission)
     acl_manager.share_with(object_id, target_user["id"], share_req.permission)
     return {"detail": f"Objek {object_id} dibagikan ke {share_req.username} dengan izin {share_req.permission}"}
+
+class RevokeRequest(BaseModel):
+    username: str
+
+# ---------- Revoke ----------
+@router.post("/{object_id}/revoke")
+def revoke_share(object_id: str, req: RevokeRequest, current_user: dict = Depends(get_current_user)):
+    """Cabut sharing: hapus ACL dan wrapped DEK milik penerima (hanya owner)."""
+    meta = object_manager.get_metadata(object_id, current_user["id"])
+    if not meta or meta["owner"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Hanya pemilik yang bisa mencabut akses")
+    target_user = db.get_user_by_username(req.username)
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User tujuan tidak ditemukan")
+    ok = object_manager.revoke_share(object_id, current_user["id"], target_user["id"])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Gagal mencabut akses")
+    return {"detail": f"Akses {req.username} pada objek {object_id} dicabut"}
+
+# ---------- Shares ----------
+@router.get("/{object_id}/shares")
+def list_shares(object_id: str, current_user: dict = Depends(get_current_user)):
+    """Daftar pengguna yang memegang wrapped key pada objek ini."""
+    shares = object_manager.list_shares(object_id, current_user["id"])
+    if shares is None:
+        raise HTTPException(status_code=404, detail="Objek tidak ditemukan atau akses ditolak")
+    return shares

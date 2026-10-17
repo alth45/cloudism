@@ -5,6 +5,7 @@ import typer
 import requests
 from cloudsim.cli.auth_commands import get_token_and_key, API_BASE
 from cloudsim.crypto.aes_custom import AES256CTR
+from cloudsim.crypto.key_wrapping import generate_dek, wrap_key
 from cloudsim.crypto.utils import encode_base64, decode_base64
 
 app = typer.Typer(help="Manajemen bucket & objek gaya gcloud storage (gs://bucket/obj)")
@@ -57,12 +58,26 @@ def _bucket_id_by_name(token: str, name: str) -> str:
 
 
 def _upload_file(token: str, key: bytes, filepath: str, bucket_id: str | None) -> dict:
-    """Enkripsi lokal lalu upload (opsional ke bucket). Mengembalikan metadata."""
+    """Enkripsi lokal lalu upload (opsional ke bucket). Mengembalikan metadata.
+
+    Mode shareable diaktifkan dengan env CLOUDSIM_SHARE_PASS: payload
+    dienkripsi dengan DEK acak dan DEK dibungkus via PBKDF2/key-wrapping
+    sehingga objek bisa dibagikan lewat `object share` (re-encryption).
+    """
     filename = os.path.basename(filepath)
     with open(filepath, "rb") as f:
         plaintext = f.read()
-    cipher = AES256CTR(key)
-    encrypted, nonce = cipher.encrypt(plaintext)
+    dek_wrapping = None
+    dek = None
+    share_pass = os.environ.get("CLOUDSIM_SHARE_PASS")
+    if share_pass:
+        dek = generate_dek()
+        cipher = AES256CTR(dek)
+        encrypted, nonce = cipher.encrypt(plaintext)
+        dek_wrapping = wrap_key(dek, share_pass)
+    else:
+        cipher = AES256CTR(key)
+        encrypted, nonce = cipher.encrypt(plaintext)
     req_data = {
         "encrypted_payload": encode_base64(encrypted),
         "nonce": encode_base64(nonce),
@@ -71,10 +86,16 @@ def _upload_file(token: str, key: bytes, filepath: str, bucket_id: str | None) -
     }
     if bucket_id:
         req_data["bucket_id"] = bucket_id
+    if dek_wrapping:
+        req_data["dek_wrapping"] = dek_wrapping
     resp = requests.post(f"{API_BASE}/objects/upload", json=req_data, headers=_get_headers(token))
     if resp.status_code != 200:
         _die(resp)
-    return resp.json()
+    meta = resp.json()
+    if dek is not None:
+        from cloudsim.cli.object_commands import _remember_dek
+        _remember_dek(meta["id"], dek)
+    return meta
 
 
 def _download_object(token: str, key: bytes, object_id: str, output: str | None) -> str:
@@ -83,8 +104,8 @@ def _download_object(token: str, key: bytes, object_id: str, output: str | None)
     if resp.status_code != 200:
         _die(resp)
     data = resp.json()
-    cipher = AES256CTR(key)
-    plaintext = cipher.decrypt(decode_base64(data["encrypted_payload"]), decode_base64(data["nonce"]))
+    from cloudsim.cli.object_commands import _decrypt_with_fallback
+    plaintext, _method = _decrypt_with_fallback(data, key)
     filename = output or data["filename"]
     with open(filename, "wb") as f:
         f.write(plaintext)
