@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import List
 from cloudsim.core.engine import CloudObjectManager
 from cloudsim.api.dependencies import get_current_user
-from cloudsim.db.database import db
+from cloudsim.db.database import db, get_trash_retention_days
 from cloudsim.core.acl import acl as acl_manager
 from cloudsim.storage.storage_manager import StorageManager
 
@@ -86,6 +86,73 @@ def upload_object(req: UploadRequest, current_user: dict = Depends(get_current_u
     )
     return metadata
 
+# ==================== SOFT DELETE & TRASH ====================
+# Catatan: rute statis /trash* didaftarkan SEBELUM rute dinamis /{object_id}
+# agar tidak tertangkap sebagai parameter.
+
+class TrashItemResponse(BaseModel):
+    id: str
+    filename: str
+    size: int
+    mime_type: str
+    created_at: str
+    bucket_id: str | None = None
+    version: int = 1
+    trashed_at: str | None = None
+    purge_after: str | None = None
+    days_remaining: float | None = None
+
+class TrashListResponse(BaseModel):
+    items: List[TrashItemResponse]
+    count: int
+    auto_purged: int
+    retention_days: int
+
+@router.get("/trash", response_model=TrashListResponse)
+def list_trash(bucket_id: str | None = None, current_user: dict = Depends(get_current_user)):
+    """Daftar objek di trash milik user beserta sisa retensinya.
+    Sekaligus memicu purge otomatis untuk objek yang lewat batas retensi."""
+    purged = object_manager.auto_purge_expired()
+    items = object_manager.list_trash(current_user["id"], bucket_id=bucket_id)
+    return {
+        "items": items,
+        "count": len(items),
+        "auto_purged": purged,
+        "retention_days": get_trash_retention_days(),
+    }
+
+@router.delete("/trash/empty")
+def empty_trash(current_user: dict = Depends(get_current_user)):
+    """Kosongkan trash: hapus permanen seluruh objek di trash milik user."""
+    n = object_manager.empty_trash(current_user["id"])
+    return {"detail": f"{n} objek dihapus permanen dari trash", "purged": n}
+
+@router.post("/{object_id}/trash")
+def soft_delete_object(object_id: str, current_user: dict = Depends(get_current_user)):
+    """Soft delete: pindahkan objek ke trash (hanya pemilik)."""
+    result = object_manager.soft_delete(object_id, current_user["id"])
+    if result is None:
+        raise HTTPException(status_code=404,
+                            detail="Objek tidak ditemukan, bukan milik Anda, atau sudah di trash")
+    return {"detail": f"Objek {object_id} dipindahkan ke trash", **result}
+
+@router.post("/{object_id}/restore")
+def restore_trashed_object(object_id: str, current_user: dict = Depends(get_current_user)):
+    """Keluarkan objek dari trash dan aktifkan kembali (hanya pemilik)."""
+    result = object_manager.restore_from_trash(object_id, current_user["id"])
+    if result is None:
+        raise HTTPException(status_code=404,
+                            detail="Objek tidak ditemukan di trash atau bukan milik Anda")
+    return {"detail": f"Objek {object_id} berhasil dipulihkan dari trash", **result}
+
+@router.delete("/{object_id}/purge")
+def purge_trashed_object(object_id: str, current_user: dict = Depends(get_current_user)):
+    """Hapus permanen satu objek dari trash sebelum batas retensinya (hanya pemilik)."""
+    if not object_manager.purge_object(object_id, current_user["id"]):
+        raise HTTPException(status_code=404,
+                            detail="Objek tidak ditemukan di trash atau bukan milik Anda")
+    return {"detail": f"Objek {object_id} dihapus permanen"}
+
 # ---------- Info ----------
 @router.get("/{object_id}", response_model=ObjectMetadataResponse)
 def get_object_info(object_id: str, current_user: dict = Depends(get_current_user)):
@@ -110,14 +177,22 @@ def download_object(object_id: str, version_id: str | None = None,
         raise HTTPException(status_code=404, detail="Objek/versi tidak ditemukan atau akses ditolak")
     return data
 
-# ---------- Delete ----------
+# ---------- Delete (soft delete ke trash) ----------
 @router.delete("/{object_id}")
-def delete_object(object_id: str, current_user: dict = Depends(get_current_user)):
-    """Hapus objek. Hanya pemilik atau admin yang bisa."""
-    success = object_manager.delete(object_id, current_user["id"])
-    if not success:
+def delete_object(object_id: str, permanent: bool = False,
+                  current_user: dict = Depends(get_current_user)):
+    """Hapus objek. Secara default SOFT DELETE (pindah ke trash dengan retensi).
+    Gunakan `?permanent=true` untuk hapus permanen langsung (tanpa lewat trash).
+    Hanya pemilik yang bisa."""
+    if permanent:
+        success = object_manager.delete(object_id, current_user["id"])
+        if not success:
+            raise HTTPException(status_code=404, detail="Objek tidak ditemukan atau tidak bisa dihapus")
+        return {"detail": "Objek berhasil dihapus permanen", "mode": "permanent"}
+    result = object_manager.soft_delete(object_id, current_user["id"])
+    if result is None:
         raise HTTPException(status_code=404, detail="Objek tidak ditemukan atau tidak bisa dihapus")
-    return {"detail": "Objek berhasil dihapus"}
+    return {"detail": "Objek dipindahkan ke trash", "mode": "trash", **result}
 
 # ---------- Share ----------
 @router.post("/{object_id}/share")

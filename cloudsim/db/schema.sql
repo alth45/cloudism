@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS objects (
     -- 0 = private, 1 = public
     bucket_id TEXT,
     -- wadah logis (FK ke buckets.id; NULL = objek tanpa bucket)
+    current_version_id TEXT,
+    -- pointer ke versi aktif (object_versions.version_id); diisi via migrasi ALTER untuk DB lama
     status TEXT NOT NULL DEFAULT 'active',
     -- 'active' | 'trashed' (soft delete; 'deleted' = hard delete langsung dari purge)
     trashed_at TEXT,

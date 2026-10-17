@@ -1,11 +1,11 @@
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from cloudsim.core.id_generator import generate_object_id, generate_bucket_id, generate_version_id
 from cloudsim.core.acl import acl as acl_manager
-from cloudsim.db.database import db
+from cloudsim.db.database import db, get_trash_retention_days
 from cloudsim.storage.storage_manager import StorageManager
 
 
@@ -251,6 +251,132 @@ class CloudObjectManager:
         # Hapus ACL
         acl_manager.revoke_access(object_id, user_id)  # kurang lengkap, tapi ok
         return True
+
+    # ==================== SOFT DELETE & TRASH ====================
+    def _trash_window(self):
+        """(trashed_at_iso, purge_after_iso) sesuai konfigurasi retensi saat ini."""
+        now = datetime.now(timezone.utc)
+        days = get_trash_retention_days()
+        return now.isoformat(), (now + timedelta(days=days)).isoformat()
+
+    def soft_delete(self, object_id: str, user_id: str) -> Optional[dict]:
+        """Soft delete: pindahkan objek ke trash dengan batas retensi waktu.
+
+        Hanya owner yang bisa melakukan. Objek yang sudah berada di trash
+        tidak bisa ditras ulang (kembalikan None). Mengembalikan metadata
+        trash (termasuk `purge_after`) bila sukses."""
+        obj = db.get_object_by_id(object_id)
+        if not obj or obj["owner_id"] != user_id:
+            return None
+        if "status" in obj.keys() and obj["status"] == "trashed":
+            return None  # sudah di trash
+        trashed_at, purge_after = self._trash_window()
+        if not db.mark_object_trashed(object_id, trashed_at, purge_after):
+            return None
+        # Tombstone non-destruktif di storage (objek belum hilang permanen)
+        self.storage.append_record({
+            "id": object_id,
+            "trashed": True,
+            "trashed_at": trashed_at,
+            "purge_after": purge_after,
+        })
+        return {
+            "id": object_id,
+            "filename": obj["filename"],
+            "trashed_at": trashed_at,
+            "purge_after": purge_after,
+            "retention_days": get_trash_retention_days(),
+        }
+
+    def restore_from_trash(self, object_id: str, user_id: str) -> Optional[dict]:
+        """Keluarkan objek dari trash dan aktifkan kembali (hanya owner)."""
+        obj = db.get_object_by_id(object_id)
+        if not obj or obj["owner_id"] != user_id:
+            return None
+        if not db.restore_object_from_trash(object_id):
+            return None
+        self.storage.append_record({
+            "id": object_id,
+            "restored_from_trash": True,
+            "restored_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return {
+            "id": object_id,
+            "filename": obj["filename"],
+            "restored_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def list_trash(self, user_id: str, bucket_id: str = None) -> list[dict]:
+        """Daftar objek di trash milik user, termasuk sisa hari retensi."""
+        out = []
+        for r in db.list_trashed_objects(user_id, bucket_id):
+            keys = r.keys()
+            remaining = None
+            if "purge_after" in keys and r["purge_after"]:
+                try:
+                    dt = datetime.fromisoformat(r["purge_after"])
+                    remaining = max((dt - datetime.now(timezone.utc)).total_seconds() / 86400.0, 0.0)
+                except ValueError:
+                    remaining = None
+            out.append({
+                "id": r["id"],
+                "filename": r["filename"],
+                "size": r["size"],
+                "mime_type": r["mime_type"],
+                "created_at": r["created_at"],
+                "bucket_id": r["bucket_id"] if "bucket_id" in keys else None,
+                "version": r["version"] if "version" in keys else 1,
+                "trashed_at": r["trashed_at"] if "trashed_at" in keys else None,
+                "purge_after": r["purge_after"] if "purge_after" in keys else None,
+                "days_remaining": round(remaining, 2) if remaining is not None else None,
+            })
+        return out
+
+    def trash_count(self, user_id: str) -> int:
+        return db.count_trashed_objects(user_id)
+
+    def purge_object(self, object_id: str, user_id: str) -> bool:
+        """Hapus permanen satu objek dari trash sebelum batas waktunya (hanya owner)."""
+        obj = db.get_object_by_id(object_id)
+        if not obj or obj["owner_id"] != user_id:
+            return False
+        if "status" not in obj.keys() or obj["status"] != "trashed":
+            return False  # hanya objek di trash yang boleh di-purge manual
+        self.storage.append_record({
+            "id": object_id,
+            "deleted": True,
+            "permanently_deleted_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return db.delete_object(object_id)
+
+    def empty_trash(self, user_id: str) -> int:
+        """Hapus permanen seluruh isi trash milik user. Kembalikan jumlah objek."""
+        purged = 0
+        for r in db.list_trashed_objects(user_id):
+            if db.delete_object(r["id"]):
+                purged += 1
+                self.storage.append_record({
+                    "id": r["id"],
+                    "deleted": True,
+                    "permanently_deleted_at": datetime.now(timezone.utc).isoformat(),
+                })
+        return purged
+
+    def auto_purge_expired(self) -> int:
+        """Purge otomatis objek di trash yang melewati batas retensi.
+
+        Dipanggil lazy (mis. saat listing trash / awal sesi). Mengembalikan
+        jumlah objek yang dipurge."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        expired = db.get_expired_trash_ids(now_iso)
+        for oid in expired:
+            self.storage.append_record({
+                "id": oid,
+                "deleted": True,
+                "auto_purged_at": now_iso,
+            })
+            db.delete_object(oid)
+        return len(expired)
 
     def list_accessible_objects(self, user_id: str, bucket_id: str = None) -> list[dict]:
         """List objek yang dapat diakses user, dari DB.
