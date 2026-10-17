@@ -1,13 +1,22 @@
 # pyrefly: ignore [missing-import]
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel
 from cloudsim.core.security import auth_manager
 from cloudsim.core.id_generator import generate_user_id
+from cloudsim.core.audit import audit_logger, RT_AUTH, R_SUCCESS, R_DENIED
 from cloudsim.db.database import db
 from cloudsim.crypto.key_derivation import pbkdf2_sha256
 from cloudsim.crypto.utils import generate_key_salt
 
 router = APIRouter()
+
+
+def _client_ip(request: Request) -> str:
+    """IP asal permintaan (untuk kolom `source` audit log)."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 class RegisterRequest(BaseModel):
     username: str
