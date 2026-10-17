@@ -16,7 +16,7 @@ CloudSim adalah simulator penyimpanan cloud berbasis Python yang meniru perilaku
 - **Client-side Encryption** – File dienkripsi di sisi client sebelum dikirim ke server; server tidak pernah melihat plaintext.
 - **Basis Data Metadata** – SQLite untuk menyimpan metadata objek, pengguna, dan ACL.
 - **Append-only Storage** – Log immutable di `storage.txt` untuk mendukung versioning dan audit.
-- **Versioning Nyata per Objek** – Setiap versi punya flag `version_id` (`ver-...`) sendiri; upload ulang nama+bucket yang sama menambah versi baru (bukan menimpa), riwayat lama dapat diunduh, dan versi lama bisa di-*restore* secara non-destructive.
+- **Versioning Nyata per Objek** – Setiap versi punya flag `version_id` (`ver-...`) sendiri; upload ulang nama+bucket yang sama menambah versi baru (bukan menimpa), riwayat lama dapat diunduh, dan versi lama bisa di-*restore* secara non-destructive. Tersedia via REST API dan CLI (`versions`, `restore`, `download --version-id`).
 
 
 ## Arsitektur
@@ -39,9 +39,9 @@ CloudSim adalah simulator penyimpanan cloud berbasis Python yang meniru perilaku
 
 ```
 - **Core Engine** – Logika CRUD, enkripsi/dekripsi, ACL, key-wrapping (re-encryption), generator ID.
-- **API** – Lapisan HTTP dengan autentikasi Bearer token (JWT manual), termasuk endpoint `/buckets` serta `/objects/{id}/share|revoke|shares`.
+- **API** – Lapisan HTTP dengan autentikasi Bearer token (JWT manual), termasuk endpoint `/buckets`, `/objects/{id}/share|revoke|shares`, serta `/objects/{id}/versions[/{vid}][/restore]` untuk versioning.
 - **CLI** – Antarmuka terminal yang memanggil API dan menangani enkripsi lokal; grup `storage` menerima URI `gs://bucket/objek`.
-- **Database** – Metadata bucket, objek, pengguna, hak akses, dan wrapped key per user (`object_keys`).
+- **Database** – Metadata bucket, objek, pengguna, hak akses, wrapped key per user (`object_keys`), serta riwayat versi per objek (`object_versions` + `objects.current_version_id`).
 - **File Storage** – Payload terenkripsi dalam format append-only JSON baris.
 
 ## Teknologi
@@ -131,6 +131,15 @@ python -m cloudsim.cli.cli info <object_id>
 python -m cloudsim.cli.cli download <object_id> -o <output_file>
 # Untuk objek shareable: passphrase lewat --passphrase, env CLOUDSIM_SHARE_PASS, atau prompt
 
+# Unduh versi tertentu dari riwayat (versi lama immutable & tetap tersedia)
+python -m cloudsim.cli.cli download <object_id> --version-id ver-abc123... -o lama.txt
+
+# Daftar seluruh versi objek (kolom Current menandai versi aktif)
+python -m cloudsim.cli.cli versions <object_id>
+
+# Restore versi lama menjadi versi aktif (dibuat versi baru; riwayat utuh; hanya owner)
+python -m cloudsim.cli.cli restore <object_id> ver-abc123...
+
 # Bagikan akses ke user lain (default: RE-ENCRYPTION / re-wrap DEK utk penerima)
 python -m cloudsim.cli.cli share <object_id> <username> --perm read
 # Input: passphrase khusus penerima; sampaikan lewat kanal aman
@@ -143,28 +152,53 @@ python -m cloudsim.cli.cli shares <object_id>
 # Cabut pembagian (hapus wrapped key + ACL penerima)
 python -m cloudsim.cli.cli revoke <object_id> <username>
 
-# Hapus objek (hanya owner)
+# Hapus objek (hanya owner) — seluruh riwayat versinya ikut terhapus (cascade)
 python -m cloudsim.cli.cli delete <object_id>
-
-# Daftar seluruh versi objek (flag current menunjukkan versi aktif)
-python -m cloudsim.cli.cli versions <object_id>
-
-# Unduh versi tertentu (versi lama immutable & tetap tersedia)
-python -m cloudsim.cli.cli download <object_id> --version-id ver-abc123... -o lama.txt
-
-# Restore versi lama menjadi versi aktif (dibuat versi baru; riwayat utuh)
-python -m cloudsim.cli.cli restore <object_id> ver-abc123...
 ```
 
 ### Versioning Nyata per Objek
 
-CloudSim kini menerapkan versioning nyata (mirip Google Cloud Storage):
+CloudSim menerapkan versioning nyata (mirip Google Cloud Storage):
 
-1. **Flag `version_id`** – Setiap kali objek dibuat/di-update, sistem membuat record versi dengan ID unik `ver-{12 hex}` di tabel `object_versions`; kolom `objects.current_version_id` menunjuk versi aktif.
+1. **Flag `version_id`** – Setiap kali objek dibuat/di-update, sistem membuat record versi dengan ID unik `ver-{12 hex}` di tabel `object_versions`; kolom `objects.current_version_id` menunjuk versi aktif. Field `version` pada metadata/list kini berisi nomor versi aktual (bukan hardcode).
 2. **Auto-versioning** – Upload ulang dengan `(owner, filename, bucket)` yang sama TIDAK menimpa data lama: nomor versi naik (v1 → v2 → …), snapshot ciphertext tiap versi disimpan immutable di DB maupun log append-only `storage.txt`.
 3. **List & unduh riwayat** – `GET /objects/{id}/versions`, `GET /objects/{id}/versions/{vid}`, dan `GET /objects/{id}/download?version_id=ver-...` mengembalikan versi tertentu; tanpa parameter tetap melayani versi current (kompatibel).
-4. **Restore versi lama** – `POST /objects/{id}/versions/{vid}/restore` (CLI: `restore`) menyalin versi target menjadi versi BARU lalu menandainya current — non-destructive, hanya owner.
+4. **Restore versi lama** – `POST /objects/{id}/versions/{vid}/restore` menyalin versi target menjadi versi BARU lalu menandainya current — non-destructive, hanya owner (non-owner → 403, versi tak dikenal → 404).
 5. **Cascade** – Menghapus objek ikut menghapus seluruh versinya (`ON DELETE CASCADE`).
+
+#### Endpoint REST Versi
+
+| Metode | Path | Deskripsi |
+|---|---|---|
+| GET | `/objects/{id}/versions` | Daftar seluruh versi + flag `current` |
+| GET | `/objects/{id}/versions/{vid}` | Metadata satu versi |
+| GET | `/objects/{id}/download?version_id=ver-...` | Unduh versi tertentu (immutable) |
+| POST | `/objects/{id}/versions/{vid}/restore` | Restore versi lama jadi versi baru yang active |
+
+#### Perintah CLI Terkait Versi
+
+Perintah versi tersedia pada kedua jalur CLI — grup `object` (`python -m cloudsim.cli.cli object versions ...`) maupun alias top-level (`python -m cloudsim.cli.cli versions ...`). Satu-satunya perbedaan: opsi `--version-id` pada `download` hanya tersedia via grup `object` (mis. `object download <obj> --version-id ver-...`).
+
+```bash
+$ python -m cloudsim.cli.cli upload laporan.txt          # v1 -> obj-a1b2..., ver-9f3c...
+$ python -m cloudsim.cli.cli upload laporan.txt          # nama sama -> v2 (BUKAN menimpa)
+Upload berhasil!
+  ID        : obj-a1b2c3d4e5f6
+  Nama file : laporan.txt
+  Ukuran    : 2048 bytes
+              # (server mencatat: Versi v2, version_id ver-7ab21e9c4d05 — lihat `versions`)
+
+$ python -m cloudsim.cli.cli versions obj-a1b2c3d4e5f6
+Version ID         Ver   Ukuran  Current  Dibuat
+------------------------------------------------------------------------
+ver-7ab21e9c4d05    2      2048  YA       2026-10-17 08:12:33
+ver-9f3c8a21bb70    1      1024           2026-10-16 19:45:02
+
+$ python -m cloudsim.cli.cli restore obj-a1b2c3d4e5f6 ver-9f3c8a21bb70
+Versi ver-9f3c8a21bb70 berhasil di-restore sebagai versi 3
+  Versi baru    : v3 (ver-c0ffee123456)   # salinan v1 — riwayat [3,2,1] tetap utuh
+  Restored from : ver-9f3c8a21bb70
+```
 
 Skema lama dimigrasi otomatis: tabel `object_versions` dibuat saat startup dan kolom `current_version_id` ditambahkan via `ALTER TABLE`.
 
@@ -239,6 +273,13 @@ python -m cloudsim.cli.cli storage ls gs://data-alice
 python -m cloudsim.cli.cli storage stat gs://data-alice/arsip/rahasia.txt
 python -m cloudsim.cli.cli storage cp gs://data-alice/arsip/rahasia.txt ./salinan.txt
 
+# Alur versioning nyata per objek
+echo "draf v1" > laporan.txt && python -m cloudsim.cli.cli upload laporan.txt
+echo "revisi v2" > laporan.txt && python -m cloudsim.cli.cli upload laporan.txt  # -> v2, v1 tetap tersimpan
+python -m cloudsim.cli.cli versions <object_id>                                  # daftar ver-... + flag current
+python -m cloudsim.cli.cli object download <object_id> --version-id ver-<v1> -o laporan_v1.txt
+python -m cloudsim.cli.cli restore <object_id> ver-<v1>                           # v1 disalin jadi v3 (current)
+
 # Alur sharing dengan re-encryption (key-wrapping + PBKDF2)
 # Terminal 2 (alice, owner):
 CLOUDSIM_SHARE_PASS=rahasia123 python -m cloudsim.cli.cli upload rahasia.txt --shareable
@@ -304,14 +345,14 @@ Pengujian mencakup:
 │   │   ├── key_wrapping.py# Envelope encryption: generate DEK, wrap/unwrap via KEK PBKDF2
 │   │   └── utils.py       # Base64, XOR, padding
 │   ├── db/                # Database
-│   │   ├── database.py    # SQLite manager (+ tabel buckets & object_keys)
+│   │   ├── database.py    # SQLite manager (+ tabel buckets, object_keys & object_versions)
 │   │   └── schema.sql
 │   ├── api/               # REST API
 │   │   ├── app.py
 │   │   ├── dependencies.py
 │   │   └── routes/
 │   │       ├── auth.py
-│   │       ├── objects.py # CRUD objek + share re-encryption, revoke, shares
+│   │       ├── objects.py # CRUD objek + share re-encryption, revoke, shares, versions & restore
 │   │       ├── buckets.py # CRUD bucket & resolusi gs://bucket/obj
 │   │       └── admin.py
 │   ├── cli/               # Command Line Interface
