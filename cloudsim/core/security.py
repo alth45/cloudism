@@ -10,7 +10,14 @@ class AuthManager:
     """Menangani registrasi, login, token (JWT manual), dan hashing password."""
     
     def __init__(self, secret_key: str = None):
-        self.secret_key = secret_key or base64.b64encode(os.urandom(32)).decode()
+        # Prioritas: argumen eksplisit > env CLOUDSIM_JWT_SECRET > acak.
+        # Env var menjamin konsistensi token create/verify saat proses
+        # yang sama memuat modul melalui jalur berbeda (mis. plugin pytest).
+        self.secret_key = (
+            secret_key
+            or os.environ.get("CLOUDSIM_JWT_SECRET")
+            or base64.b64encode(os.urandom(32)).decode()
+        )
     
     # ---------- Password ----------
     def hash_password(self, password: str, salt: bytes = None) -> tuple[str, str]:

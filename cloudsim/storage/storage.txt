@@ -27,3 +27,8 @@
 {"id": "obj-f949c0aea4b4", "owner": "usr-8a08ee85", "filename": "a.txt", "mime_type": "application/octet-stream", "encrypted_payload": "wYTAKBk=", "nonce": "B7l12+YJ9ag=", "created_at": "2026-10-17T07:12:24.275489+00:00", "bucket_id": null, "deleted": false}
 {"id": "obj-7339fa512b63", "owner": "usr-5dc28f3a", "filename": "rahasia.txt", "mime_type": "text/plain", "encrypted_payload": "k3GsbCv6nw+oDYBrYSJ2amC0KeIE", "nonce": "px4QQrbajlE=", "created_at": "2026-10-17T07:12:27.008976+00:00", "bucket_id": "bkt-16c5457d", "deleted": false}
 {"id": "obj-7339fa512b63", "deleted": true, "deleted_at": "2026-10-17T07:12:27.679504+00:00"}
+{"id": "obj-932e280575c1", "owner": "usr-6bfa279f", "filename": "test.txt", "mime_type": "text/plain", "encrypted_payload": "vwV7gLb3b/YM+2rZSOz6", "nonce": "nheMj1GVja0=", "created_at": "2026-10-17T07:18:28.428314+00:00", "bucket_id": null, "deleted": false}
+{"id": "obj-932e280575c1", "deleted": true, "deleted_at": "2026-10-17T07:18:28.440747+00:00"}
+{"id": "obj-d42b03c60fa2", "owner": "usr-174bc141", "filename": "rahasia.txt", "mime_type": "text/plain", "encrypted_payload": "65ICb2FLEIBGPvAa2xfdnaUvPfZF", "nonce": "aqsjW3sae8s=", "created_at": "2026-10-17T07:18:29.115047+00:00", "bucket_id": "bkt-8ad5e2ea", "deleted": false}
+{"id": "obj-d42b03c60fa2", "deleted": true, "deleted_at": "2026-10-17T07:18:29.767504+00:00"}
+{"id": "obj-69be9a65a7f6", "owner": "usr-0a3dde7f", "filename": "a.txt", "mime_type": "application/octet-stream", "encrypted_payload": "oS4ATcs=", "nonce": "gY8iesrQApU=", "created_at": "2026-10-17T07:18:30.426523+00:00", "bucket_id": null, "deleted": false}

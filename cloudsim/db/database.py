@@ -338,5 +338,17 @@ class DatabaseManager:
                 return True
         return False
 
-# Singleton database
-db = DatabaseManager()
+# Singleton database.
+# Dukungan override untuk pengujian: set environment variable
+# CLOUDSIM_DB_PATH=":memory:" sebelum modul diimpor agar seluruh proses
+# (termasuk plugin pytest global yang mengimpor app lebih dulu) memakai
+# database in-memory, bukan file cloudsim.db permanen.
+_DEFAULT_DB_PATH = os.environ.get("CLOUDSIM_DB_PATH")
+
+if _DEFAULT_DB_PATH == ":memory:":
+    db = DatabaseManager(":memory:")
+elif _DEFAULT_DB_PATH:
+    os.makedirs(os.path.dirname(os.path.abspath(_DEFAULT_DB_PATH)), exist_ok=True)
+    db = DatabaseManager(_DEFAULT_DB_PATH)
+else:
+    db = DatabaseManager()
