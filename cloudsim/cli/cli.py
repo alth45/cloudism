@@ -1,12 +1,13 @@
 """Entry point CLI CloudSim."""
 import typer
-from cloudsim.cli import auth_commands, object_commands, storage_commands
+from cloudsim.cli import auth_commands, object_commands, storage_commands, audit_commands
 
 app = typer.Typer(help="CloudSim CLI - Simulator Cloud Lokal")
 
 app.add_typer(auth_commands.app, name="auth", help="Manajemen autentikasi")
 app.add_typer(object_commands.app, name="object", help="Manajemen objek cloud")
 app.add_typer(storage_commands.app, name="storage", help="Bucket & objek gaya gcloud storage (gs://...)")
+app.add_typer(audit_commands.app, name="audit", help="Audit log (catatan aksi siapa, apa, kapan)")
 
 # Alias untuk perintah tanpa subcommand
 @app.command("login")

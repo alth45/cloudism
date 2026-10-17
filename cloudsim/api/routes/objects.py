@@ -6,6 +6,7 @@ from cloudsim.core.engine import CloudObjectManager
 from cloudsim.api.dependencies import get_current_user
 from cloudsim.db.database import db, get_trash_retention_days
 from cloudsim.core.acl import acl as acl_manager
+from cloudsim.core.audit import audit_logger, RT_OBJECT
 from cloudsim.storage.storage_manager import StorageManager
 
 router = APIRouter()
@@ -234,6 +235,12 @@ def share_object(
     # Mode lama: tanpa re-encryption
     db.set_acl(object_id, target_user["id"], share_req.permission)
     acl_manager.share_with(object_id, target_user["id"], share_req.permission)
+    audit_logger.record("object.share", RT_OBJECT, actor_id=current_user["id"],
+                        resource_id=object_id, resource_name=meta.get("filename"),
+                        details={"target_user_id": target_user["id"],
+                                 "target_username": share_req.username,
+                                 "permission": share_req.permission,
+                                 "re_encryption": False})
     return {"detail": f"Objek {object_id} dibagikan ke {share_req.username} dengan izin {share_req.permission}"}
 
 class RevokeRequest(BaseModel):
