@@ -34,51 +34,50 @@ class DatabaseManager:
         self._init_schema()
 
     def _init_schema(self):
-        """Jalankan schema.sql untuk membuat tabel jika belum ada."""
+        """Jalankan schema.sql untuk membuat tabel jika belum ada.
+
+        Urutan penting: migrasi kolom dilakukan SEBELUM executescript agar
+        indeks baru di schema.sql (mis. idx_objects_status) tidak gagal pada
+        database lama yang kolomnya belum ada."""
         schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
         with open(schema_path, "r") as f:
             sql = f.read()
         # Aktifkan sementara pelemahan FK agar migrasi tabel lama berjalan lancar
         self.conn.execute("PRAGMA foreign_keys = OFF")
         self._migrate_legacy_schema()
+        self._ensure_object_columns()
         self.conn.executescript(sql)
-        # Tambahkan kolom bucket_id pada tabel objects untuk database yang sudah ada.
-        # SQLite tidak mendukung IF NOT EXISTS pada ALTER TABLE, jadi tangkap error.
-        try:
-            self.conn.execute(
-                "ALTER TABLE objects ADD COLUMN bucket_id TEXT "
-                "REFERENCES buckets(id) ON DELETE SET NULL"
-            )
-        except sqlite3.OperationalError:
-            pass  # kolom sudah ada, lewati
-        # Pastikan indeks bucket ada (untuk database yang sudah ada sebelum schema.sql diperbarui)
-        try:
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_objects_bucket ON objects(bucket_id)")
-        except sqlite3.OperationalError:
-            pass
-        # Kolom flag versi aktif pada tabel objects (untuk DB lama tanpa versioning).
-        try:
-            self.conn.execute(
-                "ALTER TABLE objects ADD COLUMN current_version_id TEXT"
-            )
-        except sqlite3.OperationalError:
-            pass  # kolom sudah ada, lewati
-        # Kolom soft-delete & trash (untuk DB lama sebelum fitur trash ada).
-        for col_sql in (
-            "ALTER TABLE objects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
-            "ALTER TABLE objects ADD COLUMN trashed_at TEXT",
-            "ALTER TABLE objects ADD COLUMN purge_after TEXT",
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys = ON")
+
+    def _ensure_object_columns(self):
+        """Tambahkan kolom baru pada tabel objects untuk database lama.
+        SQLite tidak mendukung IF NOT EXISTS pada ALTER TABLE, jadi tangkap error."""
+        existing_cols = None
+        if self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='objects'"
+        ).fetchone():
+            existing_cols = {r[1] for r in
+                             self.conn.execute("PRAGMA table_info(objects)").fetchall()}
+        else:
+            return  # DB baru; schema.sql yang akan membuat tabel lengkap
+        for col_name, col_sql in (
+            # bucket_id (fitur buckets)
+            ("bucket_id", "ALTER TABLE objects ADD COLUMN bucket_id TEXT "
+                          "REFERENCES buckets(id) ON DELETE SET NULL"),
+            # flag versi aktif (fitur versioning)
+            ("current_version_id", "ALTER TABLE objects ADD COLUMN current_version_id TEXT"),
+            # soft-delete & trash
+            ("status", "ALTER TABLE objects ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
+            ("trashed_at", "ALTER TABLE objects ADD COLUMN trashed_at TEXT"),
+            ("purge_after", "ALTER TABLE objects ADD COLUMN purge_after TEXT"),
         ):
+            if col_name in existing_cols:
+                continue  # kolom sudah ada, lewati
             try:
                 self.conn.execute(col_sql)
             except sqlite3.OperationalError:
-                pass  # kolom sudah ada, lewati
-        try:
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_objects_status ON objects(status)")
-        except sqlite3.OperationalError:
-            pass
-        self.conn.commit()
-        self.conn.execute("PRAGMA foreign_keys = ON")
+                pass
 
     def _migrate_legacy_schema(self):
         """Migrasi database lama: bangun ulang tabel `objects` tanpa kolom bucket_id
@@ -389,8 +388,11 @@ class DatabaseManager:
         )
         return cur.fetchall()
 
-    def count_objects_in_bucket(self, bucket_id: str) -> int:
-        cur = self.conn.execute("SELECT COUNT(*) as cnt FROM objects WHERE bucket_id = ?", (bucket_id,))
+    def count_objects_in_bucket(self, bucket_id: str, include_trashed: bool = False) -> int:
+        sql = "SELECT COUNT(*) as cnt FROM objects WHERE bucket_id = ?"
+        if not include_trashed:
+            sql += " AND status = 'active'"
+        cur = self.conn.execute(sql, (bucket_id,))
         row = cur.fetchone()
         return row["cnt"] if row else 0
 

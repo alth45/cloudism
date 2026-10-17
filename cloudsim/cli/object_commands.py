@@ -238,13 +238,111 @@ def download(object_id: str = typer.Argument(..., help="ID objek"),
         print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
 
 @app.command("delete")
-def delete(object_id: str = typer.Argument(..., help="ID objek")):
-    """Hapus objek dari cloud."""
+def delete(object_id: str = typer.Argument(..., help="ID objek"),
+           permanent: bool = typer.Option(False, "--permanent",
+                                          help="Hapus permanen langsung (lewati trash)")):
+    """Hapus objek dari cloud.
+
+    Default: SOFT DELETE — objek dipindahkan ke trash dan bisa dipulihkan
+    selama masa retensi (lihat `trash-list`). Dengan --permanent, objek
+    langsung dihapus permanen tanpa lewat trash."""
     token, _ = get_token_and_key()
     if not token:
         return
     try:
-        resp = requests.delete(f"{API_BASE}/objects/{object_id}", headers=_get_headers(token))
+        params = {"permanent": "true"} if permanent else None
+        resp = requests.delete(f"{API_BASE}/objects/{object_id}",
+                               headers=_get_headers(token), params=params)
+        if resp.status_code == 200:
+            body = resp.json()
+            print(body["detail"])
+            if body.get("mode") == "trash":
+                print(f"  Trashed at   : {body.get('trashed_at')}")
+                print(f"  Purge after  : {body.get('purge_after')} "
+                      f"(~{body.get('retention_days')} hari)")
+                print("Pulihkan dengan: cloudsim objects restore-trash <ID>")
+        else:
+            print(f"Gagal: {resp.json().get('detail', resp.text)}")
+    except requests.ConnectionError:
+        print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
+
+
+@app.command("trash-list")
+def trash_list():
+    """Daftar objek di trash beserta sisa waktu retensinya."""
+    token, _ = get_token_and_key()
+    if not token:
+        return
+    try:
+        resp = requests.get(f"{API_BASE}/objects/trash", headers=_get_headers(token))
+        if resp.status_code == 200:
+            body = resp.json()
+            items = body["items"]
+            if body.get("auto_purged"):
+                print(f"{body['auto_purged']} objek telah di-purge otomatis (lewat retensi).")
+            if not items:
+                print("Trash kosong.")
+                return
+            print(f"Retensi: {body['retention_days']} hari | {body['count']} objek di trash")
+            print(f"{'ID':<16} {'Nama File':<30} {'Ukuran':>10}  {'Sisa (hari)':>11}  {'Purge after':<26}")
+            print("-" * 100)
+            for r in items:
+                rem = f"{r['days_remaining']:.1f}" if r["days_remaining"] is not None else "-"
+                print(f"{r['id']:<16} {r['filename']:<30} {r['size']:>10}  {rem:>11}  {r['purge_after'] or '-':<26}")
+        else:
+            print(f"Gagal: {resp.json().get('detail', resp.text)}")
+    except requests.ConnectionError:
+        print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
+
+
+@app.command("restore-trash")
+def restore_trash(object_id: str = typer.Argument(..., help="ID objek di trash")):
+    """Keluarkan objek dari trash dan aktifkan kembali."""
+    token, _ = get_token_and_key()
+    if not token:
+        return
+    try:
+        resp = requests.post(f"{API_BASE}/objects/{object_id}/restore",
+                             headers=_get_headers(token))
+        if resp.status_code == 200:
+            print(resp.json()["detail"])
+        else:
+            print(f"Gagal: {resp.json().get('detail', resp.text)}")
+    except requests.ConnectionError:
+        print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
+
+
+@app.command("purge")
+def purge(object_id: str = typer.Argument(..., help="ID objek di trash")):
+    """Hapus permanen satu objek dari trash sebelum batas retensinya."""
+    token, _ = get_token_and_key()
+    if not token:
+        return
+    try:
+        resp = requests.delete(f"{API_BASE}/objects/{object_id}/purge",
+                               headers=_get_headers(token))
+        if resp.status_code == 200:
+            print(resp.json()["detail"])
+        else:
+            print(f"Gagal: {resp.json().get('detail', resp.text)}")
+    except requests.ConnectionError:
+        print(f"Error: Tidak dapat terhubung ke server di {API_BASE}")
+
+
+@app.command("empty-trash")
+def empty_trash(force: bool = typer.Option(False, "--yes", "-y",
+                                           help="Tanpa konfirmasi")):
+    """Kosongkan trash: hapus permanen seluruh objek di trash milik Anda."""
+    token, _ = get_token_and_key()
+    if not token:
+        return
+    if not force:
+        confirm = typer.confirm("Yakin ingin menghapus permanen seluruh isi trash?")
+        if not confirm:
+            raise typer.Abort()
+    try:
+        resp = requests.delete(f"{API_BASE}/objects/trash/empty",
+                               headers=_get_headers(token))
         if resp.status_code == 200:
             print(resp.json()["detail"])
         else:

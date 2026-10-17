@@ -203,7 +203,7 @@ class TestBucketFlow:
         assert resp.status_code == 400
 
         # 10. Hapus objek dulu, lalu bucket bisa dihapus
-        resp = client.delete(f"/objects/{obj_id}", headers=auth_header(token1))
+        resp = client.delete(f"/objects/{obj_id}?permanent=true", headers=auth_header(token1))
         assert resp.status_code == 200
         resp = client.delete(f"/buckets/{bucket['id']}", headers=auth_header(token1))
         assert resp.status_code == 200
@@ -402,6 +402,7 @@ class TestReEncryptionShare:
         obj_id = resp.json()["id"]
         from cloudsim.db.database import db as current_db
         assert len(current_db.list_object_keys(obj_id)) == 1
-        resp = client.delete(f"/objects/{obj_id}", headers=auth_header(token1))
+        # Soft delete saja tidak menghapus baris objects, jadi gunakan hard delete
+        resp = client.delete(f"/objects/{obj_id}?permanent=true", headers=auth_header(token1))
         assert resp.status_code == 200
         assert current_db.list_object_keys(obj_id) == []

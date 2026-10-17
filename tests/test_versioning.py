@@ -153,7 +153,9 @@ class TestObjectVersioning:
         token, uid, key = register_and_get_key(client, "evi", "passE123")
         v1 = self._upload(client, token, key, b"x")
         self._upload(client, token, key, b"y")
-        assert client.delete(f"/objects/{v1['id']}", headers=auth_header(token)).status_code == 200
+        # Hapus permanen (?permanent=true) — default kini soft delete ke trash
+        assert client.delete(f"/objects/{v1['id']}?permanent=true",
+                             headers=auth_header(token)).status_code == 200
         # Semua versi ikut hilang (ON DELETE CASCADE)
         resp = client.get(f"/objects/{v1['id']}/versions", headers=auth_header(token))
         assert resp.status_code == 404
