@@ -10,6 +10,7 @@ CloudSim adalah simulator penyimpanan cloud berbasis Python yang meniru perilaku
 - **Bucket & URI `gs://`** – Manajemen bucket gaya Google Cloud Storage dengan validasi nama, resolusi path `gs://bucket/objek`, dan pemisahan objek per bucket.
 - **Keamanan Custom** – Registrasi pengguna, autentikasi token JWT buatan sendiri, dan Access Control List (ACL) per objek.
 - **Library Enkripsi Buatan** – Implementasi AES-256 mode CTR, PBKDF2 untuk derivasi kunci, dan Base64/PKCS7.
+- **Re-encryption saat Sharing** – Envelope encryption gaya key-wrapping: objek shareable dienkripsi dengan DEK acak; saat dibagikan, DEK di-*wrap* ulang untuk tiap penerima memakai KEK hasil PBKDF2(passphrase). Server tidak pernah melihat plaintext maupun DEK.
 - **API REST** – Endpoint CRUD untuk bucket, objek, autentikasi, dan manajemen pengguna (FastAPI).
 - **CLI Interaktif** – Grup perintah `auth`, `object`, dan `storage` (`mb`, `rb`, `ls`, `cp`, `rm`, `stat`) mirip `gcloud storage`.
 - **Client-side Encryption** – File dienkripsi di sisi client sebelum dikirim ke server; server tidak pernah melihat plaintext.
@@ -36,10 +37,10 @@ CloudSim adalah simulator penyimpanan cloud berbasis Python yang meniru perilaku
                                           +-----------------+
 
 ```
-- **Core Engine** – Logika CRUD, enkripsi/dekripsi, ACL, generator ID.
-- **API** – Lapisan HTTP dengan autentikasi Bearer token (JWT manual), termasuk endpoint `/buckets`.
+- **Core Engine** – Logika CRUD, enkripsi/dekripsi, ACL, key-wrapping (re-encryption), generator ID.
+- **API** – Lapisan HTTP dengan autentikasi Bearer token (JWT manual), termasuk endpoint `/buckets` serta `/objects/{id}/share|revoke|shares`.
 - **CLI** – Antarmuka terminal yang memanggil API dan menangani enkripsi lokal; grup `storage` menerima URI `gs://bucket/objek`.
-- **Database** – Metadata bucket, objek, pengguna, dan hak akses.
+- **Database** – Metadata bucket, objek, pengguna, hak akses, dan wrapped key per user (`object_keys`).
 - **File Storage** – Payload terenkripsi dalam format append-only JSON baris.
 
 ## Teknologi
@@ -87,6 +88,7 @@ export CLOUDSIM_API=http://127.0.0.1:8000 # Linux/Mac
 |---|---|---|
 | `CLOUDSIM_JWT_SECRET` | Secret key tetap untuk tanda tangan/verifikasi token JWT | Acak per proses |
 | `CLOUDSIM_DB_PATH` | Lokasi database SQLite (mis. `":memory:"` untuk mode tes) | `cloudsim.db` |
+| `CLOUDSIM_SHARE_PASS` | Passphrase pembagian untuk unwrap DEK pada download/`storage cp` objek shareable | Tidak diset (prompt interaktif) |
 
 ## Penggunaan CLI
 
@@ -114,6 +116,10 @@ python -m cloudsim.cli.cli logout
 # Upload file (dienkripsi otomatis di client)
 python -m cloudsim.cli.cli upload <path_file>
 
+# Upload sebagai objek shareable (DEK acak + key-wrapping PBKDF2)
+python -m cloudsim.cli.cli upload <path_file> --shareable
+# Input: passphrase pembagian (konfirmasi 2x). Bisa juga via --passphrase "..."
+
 # Daftar objek yang bisa diakses
 python -m cloudsim.cli.cli list
 
@@ -122,13 +128,36 @@ python -m cloudsim.cli.cli info <object_id>
 
 # Download & dekripsi
 python -m cloudsim.cli.cli download <object_id> -o <output_file>
+# Untuk objek shareable: passphrase lewat --passphrase, env CLOUDSIM_SHARE_PASS, atau prompt
 
-# Bagikan akses ke user lain
+# Bagikan akses ke user lain (default: RE-ENCRYPTION / re-wrap DEK utk penerima)
 python -m cloudsim.cli.cli share <object_id> <username> --perm read
+# Input: passphrase khusus penerima; sampaikan lewat kanal aman
+# Mode lama (hanya ACL, tanpa re-encryption):
+python -m cloudsim.cli.cli share <object_id> <username> --no-reencrypt
+
+# Daftar pembagian aktif (wrapped key per user)
+python -m cloudsim.cli.cli shares <object_id>
+
+# Cabut pembagian (hapus wrapped key + ACL penerima)
+python -m cloudsim.cli.cli revoke <object_id> <username>
 
 # Hapus objek (hanya owner)
 python -m cloudsim.cli.cli delete <object_id>
 ```
+
+### Re-encryption saat Sharing (Key-Wrapping + PBKDF2)
+
+CloudSim menerapkan pola *envelope encryption* agar sharing dapat dilakukan tanpa menyerahkan kunci utama pengguna:
+
+1. **Upload `--shareable`** – Client membangkitkan **DEK (Data Encryption Key) acak 256-bit**, mengenkripsi payload dengan DEK tersebut (AES-256-CTR), lalu menyimpan *wrapped key* milik owner: DEK dibungkus memakai **KEK = PBKDF2-HMAC-SHA256(passphrase, salt acak 16 byte, 100.000 iterasi)**.
+2. **Share** – Saat membagikan ke user lain, client melakukan **re-encryption pada kuncinya saja**: DEK yang sama di-*wrap* ulang dengan KEK yang diturunkan dari passphrase pembagian untuk penerima. Payload tidak dienkripsi ulang, dan server hanya menerima ciphertext + wrapped key baru.
+3. **Download oleh penerima** – Server mengirim ciphertext beserta wrapped key milik peminta. Penerima memasukkan passphrase → client menurunkan KEK → *unwrap* DEK → mendekripsi payload. Passphrase salah menghasilkan DEK sampah (dekripsi gagal/garbage), bukan error bocor.
+4. **Revoke** – Wrapped key dan ACL penerima dihapus dari database; penerima tidak bisa lagi membuka objek.
+
+Perbandingan dengan mode lama (`--no-reencrypt`): mode lama hanya menambah ACL, sehingga penerima harus memiliki kunci login owner — praktis hanya berguna sebagai simulasi. Dengan re-encryption, setiap penerima punya *saluran kunci sendiri* (per-user wrapped key) yang bisa dicabut individual.
+
+Kompatibilitas mundur terjaga: objek tanpa `dek_wrapping` tetap mengikuti alur lama.
 
 ### Manajemen Bucket (`storage` — gaya `gcloud storage`)
 
@@ -187,6 +216,18 @@ python -m cloudsim.cli.cli storage cp rahasia.txt gs://data-alice/arsip/rahasia.
 python -m cloudsim.cli.cli storage ls gs://data-alice
 python -m cloudsim.cli.cli storage stat gs://data-alice/arsip/rahasia.txt
 python -m cloudsim.cli.cli storage cp gs://data-alice/arsip/rahasia.txt ./salinan.txt
+
+# Alur sharing dengan re-encryption (key-wrapping + PBKDF2)
+# Terminal 2 (alice, owner):
+CLOUDSIM_SHARE_PASS=rahasia123 python -m cloudsim.cli.cli upload rahasia.txt --shareable
+python -m cloudsim.cli.cli share obj-abc123... bob            # passphrase utk bob: "untuk-bob"
+python -m cloudsim.cli.cli shares obj-abc123...               # daftar pembagian aktif
+
+# Terminal 3 (bob, penerima):
+CLOUDSIM_SHARE_PASS=untuk-bob python -m cloudsim.cli.cli download obj-abc123... -o hasil_bob.txt
+
+# Alice mencabut akses bob:
+python -m cloudsim.cli.cli revoke obj-abc123... bob
 ```
 
 ## Pengujian
@@ -212,6 +253,7 @@ Pengujian mencakup:
 - Siklus hidup bucket lengkap (`mb`, `ls`, `cp`, `stat`, `rm`, `rb` via URI `gs://`)
 - Objek tanpa bucket (mode legacy) masih berfungsi
 - Validasi penolakan nama bucket tidak valid
+- **Re-encryption share**: roundtrip wrap/unwrap DEK, determinisme PBKDF2, alur penuh owner→penerima (passphrase benar mendekripsi, passphrase salah menghasilkan sampah), kompatibilitas mundur mode `--no-reencrypt`, validasi 422 untuk `dek_wrapping` tidak valid, dan cascade penghapusan wrapped key saat objek dihapus (`class TestReEncryptionShare`)
 
 > Catatan: `pytest.ini` menonaktifkan plugin pihak ketiga yang bermasalah (`-p no:libtmux`) agar koleksi tes tidak crash di lingkungan tertentu. File data `cloudsim/storage/storage.txt` bersifat append-only — setiap run tes menambahkan baris ciphertext baru (perilaku yang memang dirancang).
 
@@ -236,16 +278,17 @@ Pengujian mencakup:
 │   ├── crypto/            # Kriptografi custom
 │   │   ├── aes_custom.py  # AES-256 CTR manual
 │   │   ├── key_derivation.py # PBKDF2
+│   │   ├── key_wrapping.py# Envelope encryption: generate DEK, wrap/unwrap via KEK PBKDF2
 │   │   └── utils.py       # Base64, XOR, padding
 │   ├── db/                # Database
-│   │   ├── database.py    # SQLite manager (+ tabel buckets)
+│   │   ├── database.py    # SQLite manager (+ tabel buckets & object_keys)
 │   │   └── schema.sql
 │   ├── api/               # REST API
 │   │   ├── app.py
 │   │   ├── dependencies.py
 │   │   └── routes/
 │   │       ├── auth.py
-│   │       ├── objects.py
+│   │       ├── objects.py # CRUD objek + share re-encryption, revoke, shares
 │   │       ├── buckets.py # CRUD bucket & resolusi gs://bucket/obj
 │   │       └── admin.py
 │   ├── cli/               # Command Line Interface
@@ -267,7 +310,8 @@ Pengujian mencakup:
 - Enkripsi end-to-end: server hanya menyimpan ciphertext, kunci ada di client.
 - Token JWT menggunakan secret key yang diatur via `CLOUDSIM_JWT_SECRET` (default acak per proses). Untuk production, set secret key tetap.
 - Nama bucket divalidasi (huruf kecil, angka, `-`, `.`, `_`) dan bucket tidak boleh dihapus selama masih berisi objek.
-- Sharing objek saat ini hanya memberikan akses ke metadata dan ciphertext; enkripsi ulang dengan kunci penerima belum diimplementasikan (pelajaran lanjutan).
+- **Sharing dengan re-encryption (key-wrapping + PBKDF2)** sudah tersedia: objek `--shareable` dienkripsi dengan DEK per-objek; setiap penerima mendapat wrapped key sendiri yang diturunkan dari passphrase pembagian (PBKDF2-HMAC-SHA256, 100.000 iterasi, salt acak per wrapping). Server tidak pernah menyimpan DEK dalam bentuk terbuka dan pembagian dapat dicabut individual lewat `revoke`.
+- Batasan model keamanan edukatif: tidak ada tag integritas (mis. HMAC/GCM) pada ciphertext maupun wrapped key, sehingga passphrase yang salah secara praktis menghasilkan plaintext sampah alih-alih error eksplisit; `storage cp` ke/dari bucket mendukung mode shareable penuh (upload shareable via env `CLOUDSIM_SHARE_PASS`, unwrap saat download).
 
 ## Lisensi
 

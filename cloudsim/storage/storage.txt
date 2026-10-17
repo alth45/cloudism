@@ -32,3 +32,13 @@
 {"id": "obj-d42b03c60fa2", "owner": "usr-174bc141", "filename": "rahasia.txt", "mime_type": "text/plain", "encrypted_payload": "65ICb2FLEIBGPvAa2xfdnaUvPfZF", "nonce": "aqsjW3sae8s=", "created_at": "2026-10-17T07:18:29.115047+00:00", "bucket_id": "bkt-8ad5e2ea", "deleted": false}
 {"id": "obj-d42b03c60fa2", "deleted": true, "deleted_at": "2026-10-17T07:18:29.767504+00:00"}
 {"id": "obj-69be9a65a7f6", "owner": "usr-0a3dde7f", "filename": "a.txt", "mime_type": "application/octet-stream", "encrypted_payload": "oS4ATcs=", "nonce": "gY8iesrQApU=", "created_at": "2026-10-17T07:18:30.426523+00:00", "bucket_id": null, "deleted": false}
+{"id": "obj-d5d85d043a9e", "owner": "usr-b2fe246b", "filename": "test.txt", "mime_type": "text/plain", "encrypted_payload": "5NWRaCuuS9AtmvGF+W3v", "nonce": "rpN1G5Wf+yY=", "created_at": "2026-10-17T07:38:21.279654+00:00", "bucket_id": null, "deleted": false}
+{"id": "obj-d5d85d043a9e", "deleted": true, "deleted_at": "2026-10-17T07:38:21.292876+00:00"}
+{"id": "obj-5176bae1b35a", "owner": "usr-88092ec0", "filename": "rahasia.txt", "mime_type": "text/plain", "encrypted_payload": "IgOkZTBkbrmRiq7OWPk09gAnmIF3", "nonce": "7dufAbLsw08=", "created_at": "2026-10-17T07:38:21.957090+00:00", "bucket_id": "bkt-2b8c4799", "deleted": false}
+{"id": "obj-5176bae1b35a", "deleted": true, "deleted_at": "2026-10-17T07:38:22.636419+00:00"}
+{"id": "obj-c64b986bf78e", "owner": "usr-23e8876b", "filename": "a.txt", "mime_type": "application/octet-stream", "encrypted_payload": "+m4wvU0=", "nonce": "2OR9XMpUGvI=", "created_at": "2026-10-17T07:38:23.305570+00:00", "bucket_id": null, "deleted": false}
+{"id": "obj-1416cd9cd1c6", "owner": "usr-e504c22d", "filename": "berbagi.txt", "mime_type": "text/plain", "encrypted_payload": "GVdNygQUrrzraZ9MyxRZ29yh68Mk+1cSOh+hQQ==", "nonce": "7D+YNDPQR4w=", "created_at": "2026-10-17T07:38:28.641741+00:00", "bucket_id": null, "deleted": false}
+{"id": "obj-0f1d3d3b44e5", "owner": "usr-e51ac0f4", "filename": "lama.txt", "mime_type": "application/octet-stream", "encrypted_payload": "PLo7EFpXOt9y", "nonce": "V7thxaFURJE=", "created_at": "2026-10-17T07:38:32.607069+00:00", "bucket_id": null, "deleted": false}
+{"id": "obj-0e29801f6924", "owner": "usr-62424485", "filename": "x.txt", "mime_type": "application/octet-stream", "encrypted_payload": "AAA=", "nonce": "AAA=", "created_at": "2026-10-17T07:38:33.268469+00:00", "bucket_id": null, "deleted": false}
+{"id": "obj-efcf829406f6", "owner": "usr-2321b89a", "filename": "y.txt", "mime_type": "application/octet-stream", "encrypted_payload": "5w==", "nonce": "AuLuQq/lKOk=", "created_at": "2026-10-17T07:38:34.542912+00:00", "bucket_id": null, "deleted": false}
+{"id": "obj-efcf829406f6", "deleted": true, "deleted_at": "2026-10-17T07:38:34.545007+00:00"}
