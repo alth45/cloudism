@@ -73,3 +73,23 @@ CREATE TABLE IF NOT EXISTS object_keys (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_object_keys_user ON object_keys(user_id);
+-- Versioning nyata per objek. Setiap upload/restore menambah baris versi baru
+-- yang immutable; objects.current_version_id adalah flag versi aktif.
+CREATE TABLE IF NOT EXISTS object_versions (
+    version_id TEXT PRIMARY KEY,          -- ver-{12 hex}, flag identitas versi
+    object_id TEXT NOT NULL,              -- objek induk
+    version INTEGER NOT NULL,             -- nomor urut versi (1, 2, 3, ...)
+    filename TEXT NOT NULL,
+    mime_type TEXT DEFAULT 'application/octet-stream',
+    size INTEGER NOT NULL,                -- ukuran payload base64
+    encrypted_payload TEXT NOT NULL,      -- snapshot ciphertext versi ini
+    nonce TEXT NOT NULL,                  -- nonce CTR versi ini
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,             -- user pembuat versi
+    is_current INTEGER NOT NULL DEFAULT 0,-- 1 = versi aktif objek
+    storage_line INTEGER,                 -- baris di storage.txt (append-only)
+    UNIQUE (object_id, version),
+    FOREIGN KEY (object_id) REFERENCES objects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_object_versions_object ON object_versions(object_id);
+CREATE INDEX IF NOT EXISTS idx_object_versions_current ON object_versions(object_id, is_current);

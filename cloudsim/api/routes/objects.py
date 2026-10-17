@@ -21,7 +21,19 @@ class ObjectMetadataResponse(BaseModel):
     mime_type: str
     created_at: str
     version: int
+    version_id: str | None = None  # flag: ID versi current objek (versioning nyata)
     bucket_id: str | None = None
+
+class VersionResponse(BaseModel):
+    version_id: str
+    object_id: str
+    version: int
+    filename: str
+    mime_type: str
+    size: int
+    created_at: str
+    created_by: str
+    current: bool
 
 class UploadRequest(BaseModel):
     encrypted_payload: str   # base64
@@ -85,11 +97,17 @@ def get_object_info(object_id: str, current_user: dict = Depends(get_current_use
 
 # ---------- Download ----------
 @router.get("/{object_id}/download")
-def download_object(object_id: str, current_user: dict = Depends(get_current_user)):
-    """Dapatkan data terenkripsi untuk di-download (client akan mendekripsi sendiri)."""
-    data = object_manager.download_encrypted(object_id, current_user["id"])
+def download_object(object_id: str, version_id: str | None = None,
+                    current_user: dict = Depends(get_current_user)):
+    """Dapatkan data terenkripsi untuk di-download (client akan mendekripsi sendiri).
+
+    Opsional `?version_id=ver-...` untuk mengunduh versi tertentu (riwayat lama
+    tetap tersedia — versi bersifat immutable). Tanpa parameter, versi current.
+    """
+    data = object_manager.download_encrypted(object_id, current_user["id"],
+                                             version_id=version_id)
     if data is None:
-        raise HTTPException(status_code=404, detail="Objek tidak ditemukan atau akses ditolak")
+        raise HTTPException(status_code=404, detail="Objek/versi tidak ditemukan atau akses ditolak")
     return data
 
 # ---------- Delete ----------
@@ -169,3 +187,38 @@ def list_shares(object_id: str, current_user: dict = Depends(get_current_user)):
     if shares is None:
         raise HTTPException(status_code=404, detail="Objek tidak ditemukan atau akses ditolak")
     return shares
+
+# ==================== VERSIONING NYATA PER OBJEK ====================
+
+@router.get("/{object_id}/versions", response_model=List[VersionResponse])
+def list_versions(object_id: str, current_user: dict = Depends(get_current_user)):
+    """Daftar seluruh versi objek (terbaru dulu) beserta flag `current`."""
+    versions = object_manager.list_versions(object_id, current_user["id"])
+    if versions is None:
+        raise HTTPException(status_code=404, detail="Objek tidak ditemukan atau akses ditolak")
+    return versions
+
+@router.get("/{object_id}/versions/{version_id}", response_model=VersionResponse)
+def get_version(object_id: str, version_id: str, current_user: dict = Depends(get_current_user)):
+    """Metadata satu versi tertentu."""
+    v = object_manager.get_version(object_id, current_user["id"], version_id)
+    if v is None:
+        raise HTTPException(status_code=404, detail="Versi tidak ditemukan atau akses ditolak")
+    return v
+
+@router.post("/{object_id}/versions/{version_id}/restore")
+def restore_version(object_id: str, version_id: str, current_user: dict = Depends(get_current_user)):
+    """Restore versi lama menjadi versi aktif.
+
+    Non-destructive: dibuat VERSI BARU yang isinya salinan versi target
+    (riwayat tetap utuh), lalu ditandai sebagai current. Hanya owner."""
+    meta = object_manager.get_metadata(object_id, current_user["id"])
+    if not meta or meta["owner"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Hanya pemilik yang bisa me-restore versi")
+    result = object_manager.restore_version(object_id, current_user["id"], version_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Versi tidak ditemukan")
+    return {
+        "detail": f"Versi {version_id} berhasil di-restore sebagai versi {result['version']}",
+        **result
+    }
