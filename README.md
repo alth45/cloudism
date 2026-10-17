@@ -152,8 +152,22 @@ python -m cloudsim.cli.cli shares <object_id>
 # Cabut pembagian (hapus wrapped key + ACL penerima)
 python -m cloudsim.cli.cli revoke <object_id> <username>
 
-# Hapus objek (hanya owner) — seluruh riwayat versinya ikut terhapus (cascade)
+# Hapus objek (hanya owner) — default SOFT DELETE: pindah ke trash
 python -m cloudsim.cli.cli delete <object_id>
+# Hapus permanen langsung (lewati trash; seluruh riwayat versi ikut terhapus/cascade)
+python -m cloudsim.cli.cli delete <object_id> --permanent
+
+# Lihat isi trash + sisa waktu retensi tiap objek
+python -m cloudsim.cli.cli trash-list
+
+# Pulihkan objek dari trash (status kembali active)
+python -m cloudsim.cli.cli restore-trash <object_id>
+
+# Hapus permanen satu objek dari trash sebelum batas retensinya
+python -m cloudsim.cli.cli purge <object_id>
+
+# Kosongkan trash sekaligus (konfirmasi interaktif; lewati dengan -y)
+python -m cloudsim.cli.cli empty-trash
 ```
 
 ### Versioning Nyata per Objek
@@ -201,6 +215,42 @@ Versi ver-9f3c8a21bb70 berhasil di-restore sebagai versi 3
 ```
 
 Skema lama dimigrasi otomatis: tabel `object_versions` dibuat saat startup dan kolom `current_version_id` ditambahkan via `ALTER TABLE`.
+
+### Soft Delete & Trash (dengan Retensi Waktu)
+
+Terinspirasi Google Cloud Storage, penghapusan objek secara default bersifat **soft delete** — objek tidak langsung musnah, melainkan dipindahkan ke **trash** dengan masa retensi.
+
+1. **Status per objek** – Tabel `objects` punya kolom `status` (`active` | `trashed`), `trashed_at`, dan `purge_after`. Semua tampilan normal (daftar objek, daftar bucket, pencarian nama, download, metadata) hanya menampilkan objek berstatus `active`.
+2. **Soft delete** – `DELETE /objects/{id}` (atau CLI `delete`) menandai objek `trashed` dan menyimpan `purge_after = trashed_at + retensi`. Riwayat versi tetap utuh selama di trash.
+3. **Retensi waktu** – Default **30 hari**, dapat diatur lewat environment variable `CLOUDSIM_TRASH_RETENTION_DAYS` (misalnya untuk pengujian). Setelah batas lewat, objek di-**purge otomatis** (lazy purge — dipicu saat `trash-list`/`GET /objects/trash` diakses); ciphertext ditandai tombstone append-only di `storage.txt`.
+4. **Restore** – `POST /objects/{id}/restore` (CLI `restore-trash`) mengembalikan objek ke status `active`; seluruh versinya kembali tersedia.
+5. **Purge manual** – `DELETE /objects/{id}/purge` (CLI `purge`) menghapus permanen satu objek dari trash sebelum batas retensi; `DELETE /objects/trash/empty` (CLI `empty-trash`) mengosongkan seluruh trash. Hapus permanen juga bisa langsung saat delete: `?permanent=true` / `--permanent` (tanpa lewat trash).
+6. **Re-upload aman** – Upload ulang dengan nama sama saat versi lama masih di trash membuat objek baru; objek di trash tidak tertimpa.
+7. **Bucket terkunci** – Bucket yang masih berisi objek di trash belum bisa dihapus (`rb` menolak sampai trash-nya dibersihkan).
+
+#### Endpoint REST Trash
+
+| Metode | Path | Deskripsi |
+|---|---|---|
+| DELETE | `/objects/{id}` | Default soft delete → trash; `?permanent=true` hapus permanen langsung |
+| GET | `/objects/trash` | Daftar isi trash + sisa retensi (`days_remaining`); memicu auto-purge |
+| POST | `/objects/{id}/trash` | Pindahkan objek active ke trash (alternatif soft delete) |
+| POST | `/objects/{id}/restore` | Pulihkan objek dari trash jadi `active` lagi |
+| DELETE | `/objects/{id}/purge` | Hapus permanen satu objek dari trash |
+| DELETE | `/objects/trash/empty` | Kosongkan trash (hapus permanen seluruh isi trash milik user) |
+
+Semua operasi trash hanya boleh dilakukan **pemilik objek** (non-owner → 404/403 sesuai rute). Rute statis `/objects/trash*` didaftarkan sebelum rute dinamis `/objects/{id}` agar tidak bentrok.
+
+Contoh respons `delete` (soft):
+```json
+{
+  "detail": "Objek dipindahkan ke trash",
+  "mode": "trash",
+  "trashed_at": "2026-10-17 08:00:00",
+  "purge_after": "2026-11-16 08:00:00",
+  "retention_days": 30
+}
+```
 
 ### Re-encryption saat Sharing (Key-Wrapping + PBKDF2)
 
@@ -291,6 +341,14 @@ CLOUDSIM_SHARE_PASS=untuk-bob python -m cloudsim.cli.cli download obj-abc123... 
 
 # Alice mencabut akses bob:
 python -m cloudsim.cli.cli revoke obj-abc123... bob
+
+# Alur soft delete & trash (retensi 30 hari, atur via CLOUDSIM_TRASH_RETENTION_DAYS)
+python -m cloudsim.cli.cli delete obj-abc123...          # -> trash (bukan musnah)
+python -m cloudsim.cli.cli list                          # objek tidak tampak lagi
+python -m cloudsim.cli.cli trash-list                    # lihat + sisa retensi
+python -m cloudsim.cli.cli restore-trash obj-abc123...   # kembalikan ke active
+python -m cloudsim.cli.cli purge obj-abc123...           # atau hapus permanen sekarang
+python -m cloudsim.cli.cli empty-trash -y                # kosongkan seluruh trash
 ```
 
 ## Pengujian
@@ -312,12 +370,13 @@ Pengujian mencakup:
 - Uji akses tanpa izin (ditolak)
 - Sharing objek
 - Dekripsi oleh user lain (harus gagal karena kunci berbeda)
-- Penghapusan objek
+- Penghapusan objek (soft delete ke trash sebagai default; hapus permanen via `?permanent=true`)
 - Siklus hidup bucket lengkap (`mb`, `ls`, `cp`, `stat`, `rm`, `rb` via URI `gs://`)
 - Objek tanpa bucket (mode legacy) masih berfungsi
 - Validasi penolakan nama bucket tidak valid
 - **Versioning nyata** (`tests/test_versioning.py`, `class TestObjectVersioning`): flag `version_id` di metadata/list, auto-versioning saat upload ulang nama+bucket sama, daftar versi dengan flag current, unduh versi lama (immutable), restore non-destructive menjadi versi baru, hanya owner yang boleh restore (403), versioning ter-scope bucket, dan cascade penghapusan seluruh versi saat objek dihapus.
 - **Re-encryption share**: roundtrip wrap/unwrap DEK, determinisme PBKDF2, alur penuh owner→penerima (passphrase benar mendekripsi, passphrase salah menghasilkan sampah), kompatibilitas mundur mode `--no-reencrypt`, validasi 422 untuk `dek_wrapping` tidak valid, dan cascade penghapusan wrapped key saat objek dihapus (`class TestReEncryptionShare`)
+- **Soft delete & trash** (`tests/test_trash.py`, `class TestTrash`): delete default masuk trash dengan `purge_after`, objek trashed hilang dari list/download/info, restore mengembalikan status `active`, purge tunggal & empty-trash menghapus permanen, auto-purge objek yang lewat retensi (`CLOUDSIM_TRASH_RETENTION_DAYS`), re-upload nama sama tidak menimpa objek di trash, non-owner tidak bisa mengakses trash milik user lain, dan bucket dengan isi trash tidak bisa dihapus
 
 > Catatan: `pytest.ini` menonaktifkan plugin pihak ketiga yang bermasalah (`-p no:libtmux`) agar koleksi tes tidak crash di lingkungan tertentu. File data `cloudsim/storage/storage.txt` bersifat append-only — setiap run tes menambahkan baris ciphertext baru (perilaku yang memang dirancang).
 
@@ -345,20 +404,20 @@ Pengujian mencakup:
 │   │   ├── key_wrapping.py# Envelope encryption: generate DEK, wrap/unwrap via KEK PBKDF2
 │   │   └── utils.py       # Base64, XOR, padding
 │   ├── db/                # Database
-│   │   ├── database.py    # SQLite manager (+ tabel buckets, object_keys & object_versions)
+│   │   ├── database.py    # SQLite manager (+ tabel buckets, object_keys, object_versions & soft-delete/trash)
 │   │   └── schema.sql
 │   ├── api/               # REST API
 │   │   ├── app.py
 │   │   ├── dependencies.py
 │   │   └── routes/
 │   │       ├── auth.py
-│   │       ├── objects.py # CRUD objek + share re-encryption, revoke, shares, versions & restore
+│   │       ├── objects.py # CRUD objek + share re-encryption, revoke, shares, versions, restore & trash (soft delete/purge)
 │   │       ├── buckets.py # CRUD bucket & resolusi gs://bucket/obj
 │   │       └── admin.py
 │   ├── cli/               # Command Line Interface
 │   │   ├── cli.py
 │   │   ├── auth_commands.py
-│   │   ├── object_commands.py
+│   │   ├── object_commands.py  # upload/download/list/delete (soft) + trash-list, restore-trash, purge, empty-trash
 │   │   └── storage_commands.py  # mb, rb, ls, cp, rm, stat
 │   └── storage/           # Penyimpanan fisik
 │       ├── storage.txt
@@ -366,7 +425,8 @@ Pengujian mencakup:
 └── tests/                 # Pengujian
     ├── conftest.py        # Fixture isolasi DB in-memory & JWT secret
     ├── test_e2e.py          # Skenario dasar, bucket, re-encryption share
-    └── test_versioning.py     # Versioning nyata: versi baru, list/download per versi, restore
+    ├── test_versioning.py     # Versioning nyata: versi baru, list/download per versi, restore
+    └── test_trash.py          # Soft delete & trash: retensi, restore, purge, auto-purge
 ```
 
 ## Keamanan & Catatan Penting
@@ -374,7 +434,8 @@ Pengujian mencakup:
 - **Custom Crypto hanya untuk edukasi**. Jangan gunakan di lingkungan produksi.
 - Enkripsi end-to-end: server hanya menyimpan ciphertext, kunci ada di client.
 - Token JWT menggunakan secret key yang diatur via `CLOUDSIM_JWT_SECRET` (default acak per proses). Untuk production, set secret key tetap.
-- Nama bucket divalidasi (huruf kecil, angka, `-`, `.`, `_`) dan bucket tidak boleh dihapus selama masih berisi objek.
+- Nama bucket divalidasi (huruf kecil, angka, `-`, `.`, `_`) dan bucket tidak boleh dihapus selama masih berisi objek — **termasuk objek yang berada di trash** (harus dipulihkan/di-purge dulu).
+- **Soft delete & trash**: `delete` default hanya memindahkan objek ke trash (`status='trashed'`) dengan retensi 30 hari (`CLOUDSIM_TRASH_RETENTION_DAYS`); objek trashed tak tampak di daftar/download sampai di-restore atau kedaluwarsa (auto-purge). Hapus permanen langsung: `--permanent`. Ciphertext di `storage.txt` bersifat append-only — purge menandainya dengan tombstone, bukan menghapus baris.
 - **Sharing dengan re-encryption (key-wrapping + PBKDF2)** sudah tersedia: objek `--shareable` dienkripsi dengan DEK per-objek; setiap penerima mendapat wrapped key sendiri yang diturunkan dari passphrase pembagian (PBKDF2-HMAC-SHA256, 100.000 iterasi, salt acak per wrapping). Server tidak pernah menyimpan DEK dalam bentuk terbuka dan pembagian dapat dicabut individual lewat `revoke`.
 - Batasan model keamanan edukatif: tidak ada tag integritas (mis. HMAC/GCM) pada ciphertext maupun wrapped key, sehingga passphrase yang salah secara praktis menghasilkan plaintext sampah alih-alih error eksplisit; `storage cp` ke/dari bucket mendukung mode shareable penuh (upload shareable via env `CLOUDSIM_SHARE_PASS`, unwrap saat download).
 

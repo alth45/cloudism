@@ -145,6 +145,9 @@ class CloudObjectManager:
         obj = db.get_object_by_id(object_id)
         if not obj:
             return None
+        # Objek di trash tidak bisa didownload (kecuali restore dulu)
+        if "status" in obj.keys() and obj["status"] == "trashed":
+            return None
         if version_id is not None:
             ver = db.get_object_version(version_id)
             if not ver or ver["object_id"] != object_id:
@@ -407,6 +410,9 @@ class CloudObjectManager:
         obj = db.get_object_by_id(object_id)
         if not obj:
             return None
+        # Objek di trash tersembunyi dari metadata publik (404)
+        if "status" in obj.keys() and obj["status"] == "trashed":
+            return None
         keys = obj.keys()
         return {
             "id": obj["id"],
@@ -426,7 +432,11 @@ class CloudObjectManager:
         Mengembalikan None jika objek tidak ada / akses ditolak."""
         if not db.check_access(object_id, user_id, "read"):
             return None
-        if not db.get_object_by_id(object_id):
+        obj = db.get_object_by_id(object_id)
+        if not obj:
+            return None
+        # Riwayat versi objek di trash tidak ditampilkan (tersembunyi)
+        if "status" in obj.keys() and obj["status"] == "trashed":
             return None
         out = []
         for v in db.list_object_versions(object_id):
