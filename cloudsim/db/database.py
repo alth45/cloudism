@@ -411,8 +411,8 @@ class DatabaseManager:
             return False
         if bucket["owner_id"] != owner_id:
             return False  # bukan pemilik
-        if self.count_objects_in_bucket(bucket_id) > 0:
-            return False  # bucket tidak kosong
+        if self.count_objects_in_bucket(bucket_id, include_trashed=True) > 0:
+            return False  # masih berisi objek (termasuk yang ada di trash)
         cur = self.conn.execute("DELETE FROM buckets WHERE id = ?", (bucket_id,))
         self.conn.commit()
         return cur.rowcount > 0
