@@ -26,6 +26,10 @@ def generate_token_id() -> str:
     """ID token: tok-{24 hex} (untuk header JWT)"""
     return f"tok-{_random_hex(24)}"
 
+def generate_log_id() -> str:
+    """ID entri audit log: log-{12 hex}"""
+    return f"log-{_random_hex(12)}"
+
 # Contoh penggunaan jika dijalankan langsung
 if __name__ == "__main__":
     print("User ID:", generate_user_id())

@@ -568,6 +568,68 @@ class DatabaseManager:
         self.conn.commit()
         return cur.rowcount > 0
     
+    # ==================== AUDIT LOG (append-only) ====================
+    def insert_audit_log(self, log_id: str, timestamp: str, action: str,
+                         resource_type: str, actor_id: str = None,
+                         actor_username: str = None, resource_id: str = None,
+                         resource_name: str = None, details: str = None,
+                         result: str = "success", source: str = None) -> bool:
+        """Tambahkan satu entri audit log (siapa, apa, kapan)."""
+        try:
+            self.conn.execute(
+                """INSERT INTO audit_log
+                   (id, timestamp, actor_id, actor_username, action, resource_type,
+                    resource_id, resource_name, details, result, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (log_id, timestamp, actor_id, actor_username, action, resource_type,
+                 resource_id, resource_name, details, result, source)
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def list_audit_logs(self, actor_id: str = None, resource_id: str = None,
+                        action: str = None, since: str = None, until: str = None,
+                        limit: int = 100, offset: int = 0) -> List[sqlite3.Row]:
+        """Query audit log dengan filter opsional, terbaru dulu."""
+        conds, params = [], []
+        if actor_id is not None:
+            conds.append("actor_id = ?"); params.append(actor_id)
+        if resource_id is not None:
+            conds.append("resource_id = ?"); params.append(resource_id)
+        if action is not None:
+            conds.append("action LIKE ?"); params.append(f"{action}%")
+        if since is not None:
+            conds.append("timestamp >= ?"); params.append(since)
+        if until is not None:
+            conds.append("timestamp <= ?"); params.append(until)
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        params += [limit, offset]
+        cur = self.conn.execute(
+            f"SELECT * FROM audit_log{where} ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?",
+            tuple(params)
+        )
+        return cur.fetchall()
+
+    def count_audit_logs(self, actor_id: str = None, resource_id: str = None,
+                         action: str = None, since: str = None, until: str = None) -> int:
+        conds, params = [], []
+        if actor_id is not None:
+            conds.append("actor_id = ?"); params.append(actor_id)
+        if resource_id is not None:
+            conds.append("resource_id = ?"); params.append(resource_id)
+        if action is not None:
+            conds.append("action LIKE ?"); params.append(f"{action}%")
+        if since is not None:
+            conds.append("timestamp >= ?"); params.append(since)
+        if until is not None:
+            conds.append("timestamp <= ?"); params.append(until)
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        cur = self.conn.execute(f"SELECT COUNT(*) AS cnt FROM audit_log{where}", tuple(params))
+        row = cur.fetchone()
+        return row["cnt"] if row else 0
+
     def check_access(self, object_id: str, user_id: str, required_perm: str = "read") -> bool:
         """Cek apakah user punya akses required_perm ke objek. 
         Owner = admin penuh. Public = read untuk semua. ACL permission diperhitungkan."""

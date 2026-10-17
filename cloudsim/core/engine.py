@@ -5,6 +5,7 @@ from typing import Optional
 
 from cloudsim.core.id_generator import generate_object_id, generate_bucket_id, generate_version_id
 from cloudsim.core.acl import acl as acl_manager
+from cloudsim.core.audit import audit_logger, RT_OBJECT, RT_BUCKET, R_SUCCESS, R_DENIED, R_FAILED
 from cloudsim.db.database import db, get_trash_retention_days
 from cloudsim.storage.storage_manager import StorageManager
 
@@ -14,6 +15,29 @@ class CloudObjectManager:
 
     def __init__(self, storage_manager: StorageManager = None):
         self.storage = storage_manager or StorageManager()
+
+    # ==================== AUDIT HELPERS ====================
+    @staticmethod
+    def _username(actor_id):
+        """Resolver nama actor untuk entri audit (best-effort)."""
+        if not actor_id:
+            return None
+        u = db.get_user_by_id(actor_id)
+        return u["username"] if u else None
+
+    def _audit(self, action, *, actor_id=None, resource_id=None,
+               resource_name=None, details=None, result=R_SUCCESS, source=None):
+        """Tulis entri audit log (siapa, apa, kapan). Non-blocking: kegagalan
+        pencatatan tidak boleh menggagalkan operasi utama."""
+        try:
+            audit_logger.record(action, RT_OBJECT,
+                                actor_id=actor_id,
+                                actor_username=self._username(actor_id),
+                                resource_id=resource_id,
+                                resource_name=resource_name,
+                                details=details, result=result, source=source)
+        except Exception:
+            pass
 
     def upload_encrypted(self, owner_id: str, filename: str,
                          encrypted_payload: str, nonce: str,
@@ -121,6 +145,12 @@ class CloudObjectManager:
                 created_at=created_at,
             )
 
+        # --- Audit: upload / versi baru (siapa, apa, kapan) ---
+        self._audit("object.upload.new" if not existing else "object.upload.version",
+                    actor_id=owner_id, resource_id=obj_id, resource_name=filename,
+                    details={"version": version_no, "version_id": version_id,
+                             "bucket_id": bucket_id, "size": payload_size})
+
         return {
             "id": obj_id,
             "owner": owner_id,
@@ -141,16 +171,26 @@ class CloudObjectManager:
         (versi lama tetap bisa diunduh — sifat immutable dari versioning).
         Tanpa version_id, kembalikan versi current."""
         if not db.check_access(object_id, user_id, "read"):
+            self._audit("object.download", actor_id=user_id, resource_id=object_id,
+                        result=R_DENIED, details={"reason": "access denied"})
             return None
         obj = db.get_object_by_id(object_id)
         if not obj:
+            self._audit("object.download", actor_id=user_id, resource_id=object_id,
+                        result=R_DENIED, details={"reason": "object not found"})
             return None
         # Objek di trash tidak bisa didownload (kecuali restore dulu)
         if "status" in obj.keys() and obj["status"] == "trashed":
+            self._audit("object.download", actor_id=user_id, resource_id=object_id,
+                        resource_name=obj["filename"], result=R_DENIED,
+                        details={"reason": "object in trash"})
             return None
         if version_id is not None:
             ver = db.get_object_version(version_id)
             if not ver or ver["object_id"] != object_id:
+                self._audit("object.download", actor_id=user_id, resource_id=object_id,
+                            resource_name=obj["filename"], result=R_DENIED,
+                            details={"reason": "version not found", "version_id": version_id})
                 return None
             payload = ver["encrypted_payload"]
             nonce_v = ver["nonce"]
@@ -176,6 +216,9 @@ class CloudObjectManager:
                 "wrap_salt": key_row["wrap_salt"],
                 "iterations": key_row["iterations"],
             }
+        self._audit("object.download", actor_id=user_id, resource_id=object_id,
+                    resource_name=obj["filename"],
+                    details={"version_id": version_id} if version_id else None)
         return result
 
     def share_with_reencryption(self, object_id: str, owner_id: str, target_user_id: str,
@@ -188,6 +231,9 @@ class CloudObjectManager:
         """
         obj = db.get_object_by_id(object_id)
         if not obj or obj["owner_id"] != owner_id:
+            self._audit("object.share", actor_id=owner_id, resource_id=object_id,
+                        result=R_DENIED,
+                        details={"target_user_id": target_user_id, "reason": "not owner"})
             return False
         created_at = datetime.now(timezone.utc).isoformat()
         ok = db.set_object_key(
@@ -200,15 +246,26 @@ class CloudObjectManager:
             created_at=created_at,
         )
         if not ok:
+            self._audit("object.share", actor_id=owner_id, resource_id=object_id,
+                        result=R_FAILED,
+                        details={"target_user_id": target_user_id, "reason": "wrapped key gagal disimpan"})
             return False
         db.set_acl(object_id, target_user_id, permission)
         acl_manager.share_with(object_id, target_user_id, permission)
+        self._audit("object.share", actor_id=owner_id, resource_id=object_id,
+                    resource_name=obj["filename"],
+                    details={"target_user_id": target_user_id,
+                            "target_username": self._username(target_user_id),
+                            "permission": permission, "re_encryption": True})
         return True
 
     def revoke_share(self, object_id: str, owner_id: str, target_user_id: str) -> bool:
         """Cabut sharing: hapus ACL dan wrapped DEK milik penerima."""
         obj = db.get_object_by_id(object_id)
         if not obj or obj["owner_id"] != owner_id:
+            self._audit("object.revoke", actor_id=owner_id, resource_id=object_id,
+                        result=R_DENIED,
+                        details={"target_user_id": target_user_id, "reason": "not owner"})
             return False
         db.remove_acl(object_id, target_user_id)
         acl_manager.revoke_access(object_id, target_user_id)
@@ -219,6 +276,10 @@ class CloudObjectManager:
             (object_id, target_user_id)
         )
         db.conn.commit()
+        self._audit("object.revoke", actor_id=owner_id, resource_id=object_id,
+                    resource_name=obj["filename"],
+                    details={"target_user_id": target_user_id,
+                            "target_username": self._username(target_user_id)})
         return cur.rowcount >= 0  # sukses meski tidak ada key yang terhapus
 
     def list_shares(self, object_id: str, user_id: str) -> Optional[list]:
@@ -241,6 +302,9 @@ class CloudObjectManager:
         """Hapus objek (hanya owner). Menambah tombstone di storage."""
         obj = db.get_object_by_id(object_id)
         if not obj or obj["owner_id"] != user_id:
+            self._audit("object.delete.permanent", actor_id=user_id,
+                        resource_id=object_id, result=R_DENIED,
+                        details={"reason": "objek tidak ada / bukan pemilik"})
             return False
         # Tandai deleted di storage
         tombstone = {
@@ -253,6 +317,8 @@ class CloudObjectManager:
         db.delete_object(object_id)
         # Hapus ACL
         acl_manager.revoke_access(object_id, user_id)  # kurang lengkap, tapi ok
+        self._audit("object.delete.permanent", actor_id=user_id, resource_id=object_id,
+                    resource_name=obj["filename"], details={"via_trash": False})
         return True
 
     # ==================== SOFT DELETE & TRASH ====================
@@ -270,11 +336,19 @@ class CloudObjectManager:
         trash (termasuk `purge_after`) bila sukses."""
         obj = db.get_object_by_id(object_id)
         if not obj or obj["owner_id"] != user_id:
+            self._audit("object.trash", actor_id=user_id, resource_id=object_id,
+                        result=R_DENIED, details={"reason": "objek tidak ada / bukan pemilik"})
             return None
         if "status" in obj.keys() and obj["status"] == "trashed":
+            self._audit("object.trash", actor_id=user_id, resource_id=object_id,
+                        resource_name=obj["filename"], result=R_DENIED,
+                        details={"reason": "sudah berada di trash"})
             return None  # sudah di trash
         trashed_at, purge_after = self._trash_window()
         if not db.mark_object_trashed(object_id, trashed_at, purge_after):
+            self._audit("object.trash", actor_id=user_id, resource_id=object_id,
+                        resource_name=obj["filename"], result=R_FAILED,
+                        details={"reason": "gagal menandai trash"})
             return None
         # Tombstone non-destruktif di storage (objek belum hilang permanen)
         self.storage.append_record({
@@ -283,6 +357,9 @@ class CloudObjectManager:
             "trashed_at": trashed_at,
             "purge_after": purge_after,
         })
+        self._audit("object.trash", actor_id=user_id, resource_id=object_id,
+                    resource_name=obj["filename"],
+                    details={"trashed_at": trashed_at, "purge_after": purge_after})
         return {
             "id": object_id,
             "filename": obj["filename"],
@@ -295,14 +372,21 @@ class CloudObjectManager:
         """Keluarkan objek dari trash dan aktifkan kembali (hanya owner)."""
         obj = db.get_object_by_id(object_id)
         if not obj or obj["owner_id"] != user_id:
+            self._audit("object.restore", actor_id=user_id, resource_id=object_id,
+                        result=R_DENIED, details={"reason": "objek tidak ada / bukan pemilik"})
             return None
         if not db.restore_object_from_trash(object_id):
+            self._audit("object.restore", actor_id=user_id, resource_id=object_id,
+                        resource_name=obj["filename"], result=R_DENIED,
+                        details={"reason": "objek tidak berada di trash"})
             return None
         self.storage.append_record({
             "id": object_id,
             "restored_from_trash": True,
             "restored_at": datetime.now(timezone.utc).isoformat(),
         })
+        self._audit("object.restore", actor_id=user_id, resource_id=object_id,
+                    resource_name=obj["filename"])
         return {
             "id": object_id,
             "filename": obj["filename"],
@@ -342,27 +426,42 @@ class CloudObjectManager:
         """Hapus permanen satu objek dari trash sebelum batas waktunya (hanya owner)."""
         obj = db.get_object_by_id(object_id)
         if not obj or obj["owner_id"] != user_id:
+            self._audit("object.purge", actor_id=user_id, resource_id=object_id,
+                        result=R_DENIED, details={"reason": "objek tidak ada / bukan pemilik"})
             return False
         if "status" not in obj.keys() or obj["status"] != "trashed":
+            self._audit("object.purge", actor_id=user_id, resource_id=object_id,
+                        resource_name=obj["filename"], result=R_DENIED,
+                        details={"reason": "objek tidak berada di trash"})
             return False  # hanya objek di trash yang boleh di-purge manual
         self.storage.append_record({
             "id": object_id,
             "deleted": True,
             "permanently_deleted_at": datetime.now(timezone.utc).isoformat(),
         })
-        return db.delete_object(object_id)
+        ok = db.delete_object(object_id)
+        self._audit("object.purge", actor_id=user_id, resource_id=object_id,
+                    resource_name=obj["filename"],
+                    result=R_SUCCESS if ok else R_FAILED,
+                    details={"via_trash": True})
+        return ok
 
     def empty_trash(self, user_id: str) -> int:
         """Hapus permanen seluruh isi trash milik user. Kembalikan jumlah objek."""
         purged = 0
+        purged_names = []
         for r in db.list_trashed_objects(user_id):
             if db.delete_object(r["id"]):
                 purged += 1
+                purged_names.append(r["filename"])
                 self.storage.append_record({
                     "id": r["id"],
                     "deleted": True,
                     "permanently_deleted_at": datetime.now(timezone.utc).isoformat(),
                 })
+                self._audit("object.purge", actor_id=user_id, resource_id=r["id"],
+                            resource_name=r["filename"],
+                            details={"via_trash": True, "trigger": "empty_trash"})
         return purged
 
     def auto_purge_expired(self) -> int:
@@ -373,12 +472,23 @@ class CloudObjectManager:
         now_iso = datetime.now(timezone.utc).isoformat()
         expired = db.get_expired_trash_ids(now_iso)
         for oid in expired:
+            obj = db.get_object_by_id(oid)
             self.storage.append_record({
                 "id": oid,
                 "deleted": True,
                 "auto_purged_at": now_iso,
             })
             db.delete_object(oid)
+            # Pencatat 'system': aksi otomatis, bukan perintah user langsung
+            try:
+                audit_logger.record("object.auto_purge", RT_OBJECT,
+                                    actor_id=None, actor_username="system",
+                                    resource_id=oid,
+                                    resource_name=obj["filename"] if obj else None,
+                                    details={"purge_after_lewat": now_iso},
+                                    result=R_SUCCESS, source="system")
+            except Exception:
+                pass
         return len(expired)
 
     def list_accessible_objects(self, user_id: str, bucket_id: str = None) -> list[dict]:
@@ -480,9 +590,16 @@ class CloudObjectManager:
         Semua riwayat lama tetap utuh. Hanya owner yang boleh me-restore."""
         obj = db.get_object_by_id(object_id)
         if not obj or obj["owner_id"] != user_id:
+            self._audit("object.version.restore", actor_id=user_id, resource_id=object_id,
+                        result=R_DENIED,
+                        details={"reason": "objek tidak ada / bukan pemilik",
+                                 "version_id": version_id})
             return None
         v = db.get_object_version(version_id)
         if not v or v["object_id"] != object_id:
+            self._audit("object.version.restore", actor_id=user_id, resource_id=object_id,
+                        resource_name=obj["filename"], result=R_DENIED,
+                        details={"reason": "versi tidak ditemukan", "version_id": version_id})
             return None
         created_at = datetime.now(timezone.utc).isoformat()
         new_no = db.next_version_number(object_id)
@@ -517,6 +634,10 @@ class CloudObjectManager:
             storage_line=line,
         )
         if not ok:
+            self._audit("object.version.restore", actor_id=user_id, resource_id=object_id,
+                        resource_name=obj["filename"], result=R_FAILED,
+                        details={"reason": "gagal membuat versi restore",
+                                 "version_id": version_id})
             return None
         # Versi restored menjadi current; baris objects mengikuti versi current
         db.set_current_version(object_id, new_vid)
@@ -529,6 +650,10 @@ class CloudObjectManager:
             updated_at=created_at,
             storage_line=line,
         )
+        self._audit("object.version.restore", actor_id=user_id, resource_id=object_id,
+                    resource_name=obj["filename"],
+                    details={"restored_from": version_id, "new_version": new_no,
+                             "new_version_id": new_vid})
         return {
             "id": object_id,
             "version": new_no,
@@ -538,13 +663,28 @@ class CloudObjectManager:
         }
 
     # ==================== BUCKET MANAGEMENT ====================
+    def _audit_bucket(self, action, *, actor_id=None, resource_id=None,
+                      resource_name=None, details=None, result=R_SUCCESS):
+        """Catat aksi bucket ke audit log (best-effort)."""
+        try:
+            audit_logger.record(action, RT_BUCKET, actor_id=actor_id,
+                                actor_username=self._username(actor_id),
+                                resource_id=resource_id, resource_name=resource_name,
+                                details=details, result=result)
+        except Exception:
+            pass
+
     def create_bucket(self, owner_id: str, name: str) -> Optional[dict]:
         """Buat bucket baru untuk user. Mengembalikan metadata bucket atau None jika gagal."""
         bucket_id = generate_bucket_id()
         created_at = datetime.now(timezone.utc).isoformat()
         success = db.create_bucket(bucket_id, name, owner_id, created_at)
         if not success:
+            self._audit_bucket("bucket.create", actor_id=owner_id, resource_name=name,
+                               result=R_FAILED, details={"reason": "nama sudah ada / gagal"})
             return None  # nama sudah ada
+        self._audit_bucket("bucket.create", actor_id=owner_id, resource_id=bucket_id,
+                           resource_name=name)
         return {
             "id": bucket_id,
             "name": name,
@@ -589,9 +729,17 @@ class CloudObjectManager:
         # Validasi kepemilikan
         bucket = db.get_bucket_by_id(bucket_id)
         if not bucket or bucket["owner_id"] != owner_id:
+            self._audit_bucket("bucket.delete", actor_id=owner_id, resource_id=bucket_id,
+                               resource_name=bucket["name"] if bucket else None,
+                               result=R_DENIED, details={"reason": "tidak ada / bukan pemilik"})
             return False
         # Delegasikan ke db.delete_bucket yang akan mengecek kekosongan
-        return db.delete_bucket(bucket_id, owner_id)
+        ok = db.delete_bucket(bucket_id, owner_id)
+        self._audit_bucket("bucket.delete", actor_id=owner_id, resource_id=bucket_id,
+                           resource_name=bucket["name"],
+                           result=R_SUCCESS if ok else R_FAILED,
+                           details=None if ok else {"reason": "bucket masih berisi objek"})
+        return ok
 
     def resolve_object(self, user_id: str, bucket_name: str, identifier: str) -> Optional[dict]:
         """Resolve path gs://bucket/identifier menjadi objek yang bisa diakses user.

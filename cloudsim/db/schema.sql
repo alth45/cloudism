@@ -102,3 +102,24 @@ CREATE TABLE IF NOT EXISTS object_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_object_versions_object ON object_versions(object_id);
 CREATE INDEX IF NOT EXISTS idx_object_versions_current ON object_versions(object_id, is_current);
+-- Audit log: catatan append-only "siapa melakukan apa terhadap objek mana, kapan".
+-- actor_type: 'user' (terautentikasi), 'system' (mis. auto-purge), 'anonymous' (login gagal).
+-- result: 'success' | 'denied' | 'failed'. Sumber kebenaran = tabel ini; salinan
+-- immutable juga ditulis ke storage.txt (baris {"audit": ...}) sebagai jejak eksternal.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id TEXT PRIMARY KEY,              -- log-{12 hex}
+    timestamp TEXT NOT NULL,          -- ISO 8601 UTC (kapan)
+    actor_id TEXT,                    -- siapa: user_id (NULL utk system/anonymous)
+    actor_username TEXT,              -- denormalisasi agar tetap terbaca meski user dihapus
+    action TEXT NOT NULL,             -- apa: auth.login, object.upload, dst.
+    resource_type TEXT NOT NULL,      -- 'object' | 'bucket' | 'auth'
+    resource_id TEXT,                 -- obj-/bkt-... yang dikenai aksi
+    resource_name TEXT,               -- nama file/bucket saat kejadian
+    details TEXT,                     -- JSON: konteks tambahan (version, permission, ...)
+    result TEXT NOT NULL DEFAULT 'success',
+    source TEXT                       -- asal permintaan (IP client / 'cli')
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id);
+CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_log(resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
