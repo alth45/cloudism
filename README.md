@@ -7,10 +7,11 @@ CloudSim adalah simulator penyimpanan cloud berbasis Python yang meniru perilaku
 ## Fitur Utama
 
 - **Penyimpanan Objek** – Setiap file disimpan sebagai objek dengan ID unik, timestamp, dan payload terenkripsi.
+- **Bucket & URI `gs://`** – Manajemen bucket gaya Google Cloud Storage dengan validasi nama, resolusi path `gs://bucket/objek`, dan pemisahan objek per bucket.
 - **Keamanan Custom** – Registrasi pengguna, autentikasi token JWT buatan sendiri, dan Access Control List (ACL) per objek.
 - **Library Enkripsi Buatan** – Implementasi AES-256 mode CTR, PBKDF2 untuk derivasi kunci, dan Base64/PKCS7.
-- **API REST** – Endpoint CRUD untuk objek, autentikasi, dan manajemen pengguna (FastAPI).
-- **CLI Interaktif** – Perintah terminal seperti `upload`, `download`, `list`, `delete`, `share`.
+- **API REST** – Endpoint CRUD untuk bucket, objek, autentikasi, dan manajemen pengguna (FastAPI).
+- **CLI Interaktif** – Grup perintah `auth`, `object`, dan `storage` (`mb`, `rb`, `ls`, `cp`, `rm`, `stat`) mirip `gcloud storage`.
 - **Client-side Encryption** – File dienkripsi di sisi client sebelum dikirim ke server; server tidak pernah melihat plaintext.
 - **Basis Data Metadata** – SQLite untuk menyimpan metadata objek, pengguna, dan ACL.
 - **Append-only Storage** – Log immutable di `storage.txt` untuk mendukung versioning dan audit.
@@ -36,9 +37,9 @@ CloudSim adalah simulator penyimpanan cloud berbasis Python yang meniru perilaku
 
 ```
 - **Core Engine** – Logika CRUD, enkripsi/dekripsi, ACL, generator ID.
-- **API** – Lapisan HTTP dengan autentikasi Bearer token (JWT manual).
-- **CLI** – Antarmuka terminal yang memanggil API dan menangani enkripsi lokal.
-- **Database** – Metadata objek, pengguna, dan hak akses.
+- **API** – Lapisan HTTP dengan autentikasi Bearer token (JWT manual), termasuk endpoint `/buckets`.
+- **CLI** – Antarmuka terminal yang memanggil API dan menangani enkripsi lokal; grup `storage` menerima URI `gs://bucket/objek`.
+- **Database** – Metadata bucket, objek, pengguna, dan hak akses.
 - **File Storage** – Payload terenkripsi dalam format append-only JSON baris.
 
 ## Teknologi
@@ -79,6 +80,13 @@ Atur environment variable `CLOUDSIM_API` jika ingin mengubah URL default CLI:
 set CLOUDSIM_API=http://127.0.0.1:8000    # Windows
 export CLOUDSIM_API=http://127.0.0.1:8000 # Linux/Mac
 ```
+
+### Environment Variable Lainnya
+
+| Variabel | Fungsi | Default |
+|---|---|---|
+| `CLOUDSIM_JWT_SECRET` | Secret key tetap untuk tanda tangan/verifikasi token JWT | Acak per proses |
+| `CLOUDSIM_DB_PATH` | Lokasi database SQLite (mis. `":memory:"` untuk mode tes) | `cloudsim.db` |
 
 ## Penggunaan CLI
 
@@ -122,6 +130,34 @@ python -m cloudsim.cli.cli share <object_id> <username> --perm read
 python -m cloudsim.cli.cli delete <object_id>
 ```
 
+### Manajemen Bucket (`storage` — gaya `gcloud storage`)
+
+```bash
+# Buat bucket (nama: huruf kecil, angka, '-', '.', '_')
+python -m cloudsim.cli.cli storage mb my-bucket
+
+# Daftar semua bucket
+python -m cloudsim.cli.cli storage ls
+
+# Daftar isi sebuah bucket
+python -m cloudsim.cli.cli storage ls gs://my-bucket
+
+# Upload file lokal ke bucket (dengan nama objek kustom)
+python -m cloudsim.cli.cli storage cp rahasia.txt gs://my-bucket/2026/rahasia.txt
+
+# Download objek dari bucket
+python -m cloudsim.cli.cli storage cp gs://my-bucket/2026/rahasia.txt ./hasil.txt
+
+# Lihat metadata objek (berdasarkan nama objek atau object ID)
+python -m cloudsim.cli.cli storage stat gs://my-bucket/2026/rahasia.txt
+
+# Hapus objek
+python -m cloudsim.cli.cli storage rm gs://my-bucket/2026/rahasia.txt
+
+# Hapus bucket (harus kosong)
+python -m cloudsim.cli.cli storage rb my-bucket
+```
+
 ### Contoh Skenario
 
 ```bash
@@ -144,18 +180,25 @@ obj-abc123...    rahasia.txt     2048     application/octet...  2026-08-11...
 
 python -m cloudsim.cli.cli download obj-abc123... -o hasil.txt
 File berhasil diunduh: hasil.txt
+
+# Alur bucket gaya gcloud storage
+python -m cloudsim.cli.cli storage mb data-alice
+python -m cloudsim.cli.cli storage cp rahasia.txt gs://data-alice/arsip/rahasia.txt
+python -m cloudsim.cli.cli storage ls gs://data-alice
+python -m cloudsim.cli.cli storage stat gs://data-alice/arsip/rahasia.txt
+python -m cloudsim.cli.cli storage cp gs://data-alice/arsip/rahasia.txt ./salinan.txt
 ```
 
 ## Pengujian
 
-Proyek dilengkapi pengujian end-to-end menggunakan `pytest` dan `TestClient` dari FastAPI.
+Proyek dilengkapi pengujian end-to-end menggunakan `pytest` dan `TestClient` dari FastAPI, dengan **isolasi penuh** (database in-memory per tes + secret JWT tetap via fixture di `tests/conftest.py`).
 
 ```bash
 # Install dependensi pengujian (jika belum)
 pip install pytest httpx
 
 # Jalankan semua pengujian
-python -m pytest tests/test_e2e.py -v
+python -m pytest tests/ -v
 ```
 
 Pengujian mencakup:
@@ -166,13 +209,21 @@ Pengujian mencakup:
 - Sharing objek
 - Dekripsi oleh user lain (harus gagal karena kunci berbeda)
 - Penghapusan objek
+- Siklus hidup bucket lengkap (`mb`, `ls`, `cp`, `stat`, `rm`, `rb` via URI `gs://`)
+- Objek tanpa bucket (mode legacy) masih berfungsi
+- Validasi penolakan nama bucket tidak valid
+
+> Catatan: `pytest.ini` menonaktifkan plugin pihak ketiga yang bermasalah (`-p no:libtmux`) agar koleksi tes tidak crash di lingkungan tertentu. File data `cloudsim/storage/storage.txt` bersifat append-only — setiap run tes menambahkan baris ciphertext baru (perilaku yang memang dirancang).
 
 ## Struktur Direktori
 
 ```
-cloudsim/
-├── plan.md                # Rencana awal proyek
+.
 ├── README.md              # Dokumentasi ini
+├── plan.md                # Rencana awal proyek
+├── plan_bucket.md         # Rencana fitur bucket & CLI storage
+├── plan_command.md        # Rencana struktur perintah CLI
+├── pytest.ini             # Konfigurasi pytest
 ├── requirements.txt       # Daftar package Python
 ├── cloudsim/              # Package utama
 │   ├── __init__.py
@@ -187,7 +238,7 @@ cloudsim/
 │   │   ├── key_derivation.py # PBKDF2
 │   │   └── utils.py       # Base64, XOR, padding
 │   ├── db/                # Database
-│   │   ├── database.py    # SQLite manager
+│   │   ├── database.py    # SQLite manager (+ tabel buckets)
 │   │   └── schema.sql
 │   ├── api/               # REST API
 │   │   ├── app.py
@@ -195,16 +246,18 @@ cloudsim/
 │   │   └── routes/
 │   │       ├── auth.py
 │   │       ├── objects.py
+│   │       ├── buckets.py # CRUD bucket & resolusi gs://bucket/obj
 │   │       └── admin.py
 │   ├── cli/               # Command Line Interface
 │   │   ├── cli.py
 │   │   ├── auth_commands.py
-│   │   └── object_commands.py
+│   │   ├── object_commands.py
+│   │   └── storage_commands.py  # mb, rb, ls, cp, rm, stat
 │   └── storage/           # Penyimpanan fisik
 │       ├── storage.txt
 │       └── storage_manager.py
 └── tests/                 # Pengujian
-    ├── conftest.py
+    ├── conftest.py        # Fixture isolasi DB in-memory & JWT secret
     └── test_e2e.py
 ```
 
@@ -212,7 +265,8 @@ cloudsim/
 
 - **Custom Crypto hanya untuk edukasi**. Jangan gunakan di lingkungan produksi.
 - Enkripsi end-to-end: server hanya menyimpan ciphertext, kunci ada di client.
-- Token JWT menggunakan secret key yang diatur via `CLOUDSIM_SECRET` (default acak). Untuk production, set secret key tetap.
+- Token JWT menggunakan secret key yang diatur via `CLOUDSIM_JWT_SECRET` (default acak per proses). Untuk production, set secret key tetap.
+- Nama bucket divalidasi (huruf kecil, angka, `-`, `.`, `_`) dan bucket tidak boleh dihapus selama masih berisi objek.
 - Sharing objek saat ini hanya memberikan akses ke metadata dan ciphertext; enkripsi ulang dengan kunci penerima belum diimplementasikan (pelajaran lanjutan).
 
 ## Lisensi
