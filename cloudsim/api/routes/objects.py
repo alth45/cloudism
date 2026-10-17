@@ -21,12 +21,14 @@ class ObjectMetadataResponse(BaseModel):
     mime_type: str
     created_at: str
     version: int
+    bucket_id: str | None = None
 
 class UploadRequest(BaseModel):
     encrypted_payload: str   # base64
     nonce: str               # base64
     filename: str
     mime_type: str = "application/octet-stream"
+    bucket_id: str | None = None  # opsional: kaitkan objek ke bucket
 
 class ShareRequest(BaseModel):
     username: str
@@ -34,20 +36,25 @@ class ShareRequest(BaseModel):
 
 # ---------- List ----------
 @router.get("/", response_model=List[ObjectMetadataResponse])
-def list_objects(current_user: dict = Depends(get_current_user)):
-    """Daftar semua objek yang dapat diakses oleh user."""
-    return object_manager.list_accessible_objects(current_user["id"])
+def list_objects(bucket_id: str | None = None, current_user: dict = Depends(get_current_user)):
+    """Daftar semua objek yang dapat diakses oleh user. Filter opsional per bucket."""
+    return object_manager.list_accessible_objects(current_user["id"], bucket_id=bucket_id)
 
 # ---------- Upload ----------
 @router.post("/upload", response_model=ObjectMetadataResponse)
 def upload_object(req: UploadRequest, current_user: dict = Depends(get_current_user)):
     """Unggah file yang sudah dienkripsi oleh client."""
+    if req.bucket_id is not None:
+        bucket = db.get_bucket_by_id(req.bucket_id)
+        if not bucket or bucket["owner_id"] != current_user["id"]:
+            raise HTTPException(status_code=404, detail="Bucket tidak ditemukan atau bukan milik Anda")
     metadata = object_manager.upload_encrypted(
         owner_id=current_user["id"],
         filename=req.filename,
         encrypted_payload=req.encrypted_payload,
         nonce=req.nonce,
-        mime_type=req.mime_type
+        mime_type=req.mime_type,
+        bucket_id=req.bucket_id
     )
     return metadata
 

@@ -17,11 +17,14 @@ def test_db():
     cloudsim.core.engine.db = db
     import cloudsim.api.routes.objects
     cloudsim.api.routes.objects.db = db
+    import cloudsim.api.dependencies
+    cloudsim.api.dependencies.db = db
     yield db
     # Kembalikan database asli
     db_module.db = original_db
     cloudsim.core.engine.db = original_db
     cloudsim.api.routes.objects.db = original_db
+    cloudsim.api.dependencies.db = original_db
 
 @pytest.fixture
 def client(test_db):

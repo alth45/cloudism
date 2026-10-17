@@ -108,3 +108,126 @@ class TestCloudSimE2E:
         resp = client.get("/objects/", headers=auth_header(token2))
         assert resp.status_code == 200
         assert len(resp.json()) == 0
+
+# ==================== SKENARIO BUCKET ====================
+
+class TestBucketFlow:
+    """Uji alur bucket: mb -> cp (upload) -> ls -> stat -> download -> rm -> rb."""
+
+    def test_full_bucket_lifecycle(self, client):
+        token1, uid1, key1 = register_and_get_key(client, "ardi", "passA123")
+        plaintext = b"rahasia arsip pribadi"
+        enc_b64, nonce_b64 = encrypt_file(plaintext, key1)
+
+        # 1. Buat bucket
+        resp = client.post("/buckets", json={"name": "arsip-pribadi"}, headers=auth_header(token1))
+        assert resp.status_code == 200, resp.text
+        bucket = resp.json()
+        assert bucket["id"].startswith("bkt-")
+        assert bucket["name"] == "arsip-pribadi"
+
+        # 2. Nama bucket unik global -> duplikat ditolak
+        resp = client.post("/buckets", json={"name": "arsip-pribadi"}, headers=auth_header(token1))
+        assert resp.status_code == 409
+
+        # 3. List bucket milik user
+        resp = client.get("/buckets", headers=auth_header(token1))
+        assert resp.status_code == 200
+        assert len(resp.json()) == 1
+        assert resp.json()[0]["name"] == "arsip-pribadi"
+
+        # 4. Upload objek ke bucket
+        resp = client.post(
+            "/objects/upload",
+            json={
+                "encrypted_payload": enc_b64,
+                "nonce": nonce_b64,
+                "filename": "rahasia.txt",
+                "mime_type": "text/plain",
+                "bucket_id": bucket["id"],
+            },
+            headers=auth_header(token1),
+        )
+        assert resp.status_code == 200, resp.text
+        obj_id = resp.json()["id"]
+        assert resp.json()["bucket_id"] == bucket["id"]
+
+        # 5. Upload ke bucket milik orang lain harus ditolak
+        token2, uid2, key2 = register_and_get_key(client, "budi", "passB123")
+        resp = client.post(
+            "/objects/upload",
+            json={
+                "encrypted_payload": enc_b64,
+                "nonce": nonce_b64,
+                "filename": "nyloncor.txt",
+                "bucket_id": bucket["id"],
+            },
+            headers=auth_header(token2),
+        )
+        assert resp.status_code == 404
+
+        # 6. List dengan filter bucket_id hanya menampilkan isi bucket
+        resp = client.get(f"/objects/?bucket_id={bucket['id']}", headers=auth_header(token1))
+        assert resp.status_code == 200
+        objs = resp.json()
+        assert len(objs) == 1 and objs[0]["id"] == obj_id
+
+        # Tanpa filter tetap menampilkan semua (1 objek)
+        resp = client.get("/objects/", headers=auth_header(token1))
+        assert len(resp.json()) == 1
+
+        # 7. Info bucket + isi
+        resp = client.get(f"/buckets/{bucket['id']}", headers=auth_header(token1))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["bucket"]["name"] == "arsip-pribadi"
+        assert len(body["objects"]) == 1
+
+        # 8. Resolve gs://bucket/nama-file -> objek
+        resp = client.get("/buckets/name/arsip-pribadi/objects/rahasia.txt", headers=auth_header(token1))
+        assert resp.status_code == 200
+        assert resp.json()["id"] == obj_id
+        assert resp.json()["bucket_name"] == "arsip-pribadi"
+
+        # Resolve via ID objek juga berhasil
+        resp = client.get(f"/buckets/name/arsip-pribadi/objects/{obj_id}", headers=auth_header(token1))
+        assert resp.status_code == 200
+        assert resp.json()["id"] == obj_id
+
+        # User lain tidak bisa resolve bucket milik ardi
+        resp = client.get("/buckets/name/arsip-pribadi/objects/rahasia.txt", headers=auth_header(token2))
+        assert resp.status_code == 404
+
+        # 9. Hapus bucket yang masih berisi objek harus gagal
+        resp = client.delete(f"/buckets/{bucket['id']}", headers=auth_header(token1))
+        assert resp.status_code == 400
+
+        # 10. Hapus objek dulu, lalu bucket bisa dihapus
+        resp = client.delete(f"/objects/{obj_id}", headers=auth_header(token1))
+        assert resp.status_code == 200
+        resp = client.delete(f"/buckets/{bucket['id']}", headers=auth_header(token1))
+        assert resp.status_code == 200
+
+        # Bucket hilang
+        resp = client.get("/buckets", headers=auth_header(token1))
+        assert resp.json() == []
+
+    def test_object_without_bucket_still_works(self, client):
+        """Kompatibilitas mundur: objek tanpa bucket (bucket_id=NULL) tetap berfungsi."""
+        token, uid, key = register_and_get_key(client, "citra", "passC123")
+        enc_b64, nonce_b64 = encrypt_file(b"hello", key)
+        resp = client.post(
+            "/objects/upload",
+            json={"encrypted_payload": enc_b64, "nonce": nonce_b64, "filename": "a.txt"},
+            headers=auth_header(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["bucket_id"] is None
+        resp = client.get("/objects/", headers=auth_header(token))
+        assert len(resp.json()) == 1
+
+    def test_invalid_bucket_names_rejected(self, client):
+        token, _, _ = register_and_get_key(client, "dwi", "passD123")
+        for bad in ["ab", "Ada-Huruf-Besar", "-awali-strip", "ada spasi"]:
+            resp = client.post("/buckets", json={"name": bad}, headers=auth_header(token))
+            assert resp.status_code == 422, f"nama '{bad}' seharusnya ditolak"

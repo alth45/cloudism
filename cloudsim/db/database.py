@@ -17,12 +17,15 @@ class DatabaseManager:
         self.conn.row_factory = sqlite3.Row  # supaya hasil query seperti dict
         self.conn.execute("PRAGMA foreign_keys = ON")
         self._init_schema()
-    
-        def _init_schema(self):
+
+    def _init_schema(self):
         """Jalankan schema.sql untuk membuat tabel jika belum ada."""
         schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
         with open(schema_path, "r") as f:
             sql = f.read()
+        # Aktifkan sementara pelemahan FK agar migrasi tabel lama berjalan lancar
+        self.conn.execute("PRAGMA foreign_keys = OFF")
+        self._migrate_legacy_schema()
         self.conn.executescript(sql)
         # Tambahkan kolom bucket_id pada tabel objects untuk database yang sudah ada.
         # SQLite tidak mendukung IF NOT EXISTS pada ALTER TABLE, jadi tangkap error.
@@ -39,6 +42,52 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             pass
         self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys = ON")
+
+    def _migrate_legacy_schema(self):
+        """Migrasi database lama: bangun ulang tabel `objects` tanpa kolom bucket_id
+        agar schema.sql baru (yang membuat tabel dengan bucket_id) bisa diterapkan.
+        Data objek tetap dipertahankan; bucket_id diisi NULL."""
+        cur = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='objects'"
+        )
+        if not cur.fetchone():
+            return  # database baru, tidak perlu migrasi
+        cols = [r[1] for r in self.conn.execute("PRAGMA table_info(objects)").fetchall()]
+        if "bucket_id" in cols:
+            return  # sudah bermigrasi
+        legacy_select = ", ".join(
+            c for c in ("id", "owner_id", "filename", "size", "mime_type",
+                        "encrypted_payload", "iv", "nonce", "created_at",
+                        "updated_at", "storage_line", "is_public")
+            if c in cols
+        ) or "id, owner_id, filename, size"
+        self.conn.executescript(
+            """
+            PRAGMA legacy_alter_table = ON;
+            DROP TABLE IF EXISTS objects_old;
+            ALTER TABLE objects RENAME TO objects_old;
+            """
+        )
+        # Buat ulang sesuai definisi baru di schema.sql (diambil dari file yang sama)
+        self._create_objects_table_from_schema()
+        self.conn.execute(
+            f"""INSERT INTO objects ({legacy_select})
+                SELECT {legacy_select} FROM objects_old"""
+        )
+        self.conn.execute("DROP TABLE objects_old")
+        self.conn.execute("PRAGMA legacy_alter_table = OFF")
+        self.conn.commit()
+
+    def _create_objects_table_from_schema(self):
+        """Ambil pernyataan CREATE TABLE objects dari schema.sql dan jalankan."""
+        import re
+        schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+        with open(schema_path, "r") as f:
+            sql = f.read()
+        m = re.search(r"CREATE TABLE IF NOT EXISTS objects \(.*?\);", sql, re.S)
+        if m:
+            self.conn.executescript(m.group(0))
     
     def close(self):
         self.conn.close()
@@ -116,22 +165,30 @@ class DatabaseManager:
         cur = self.conn.execute("DELETE FROM objects WHERE id = ?", (obj_id,))
         self.conn.commit()
         return cur.rowcount > 0
-    
-        def list_accessible_objects(self, user_id: str, bucket_id: str = None) -> List[sqlite3.Row]:
+
+    def list_accessible_objects(self, user_id: str, bucket_id: str = None) -> List[sqlite3.Row]:
         """Gabungan milik sendiri, publik, dan yang di-share.
         Jika bucket_id diberikan, filter hanya objek pada bucket tersebut."""
-        bucket_clause = ""
+        # Bangun subquery secara eksplisit agar urutan binding mudah dibaca
+        subs, params = [], []
         if bucket_id is not None:
-            bucket_clause = f" AND bucket_id = '{bucket_id}'"
-        cur = self.conn.execute(
-            f"""SELECT * FROM objects WHERE owner_id = ?{bucket_clause}
-               UNION
-               SELECT * FROM objects WHERE is_public = 1{bucket_clause}
-               UNION
-               SELECT o.* FROM objects o JOIN acl a ON o.id = a.object_id WHERE a.user_id = ?{bucket_clause}
-               ORDER BY created_at DESC""",
-            (user_id, user_id)
-        )
+            subs.append("SELECT * FROM objects WHERE owner_id = ? AND bucket_id = ?")
+            params += [user_id, bucket_id]
+            subs.append("SELECT * FROM objects WHERE is_public = 1 AND bucket_id = ?")
+            params += [bucket_id]
+            subs.append(
+                "SELECT o.* FROM objects o JOIN acl a ON o.id = a.object_id"
+                " WHERE a.user_id = ? AND o.bucket_id = ?"
+            )
+            params += [user_id, bucket_id]
+        else:
+            subs.append("SELECT * FROM objects WHERE owner_id = ?")
+            params.append(user_id)
+            subs.append("SELECT * FROM objects WHERE is_public = 1")
+            subs.append("SELECT o.* FROM objects o JOIN acl a ON o.id = a.object_id WHERE a.user_id = ?")
+            params.append(user_id)
+        sql = "SELECT * FROM (" + " UNION ".join(subs) + ") ORDER BY created_at DESC"
+        cur = self.conn.execute(sql, tuple(params))
         return cur.fetchall()
 
     def get_object_by_name_in_bucket(self, bucket_id: str, filename: str) -> Optional[sqlite3.Row]:
@@ -140,6 +197,38 @@ class DatabaseManager:
             "SELECT * FROM objects WHERE bucket_id = ? AND filename = ? ORDER BY created_at DESC LIMIT 1",
             (bucket_id, filename)
         )
+        return cur.fetchone()
+
+    def find_accessible_object_by_name(self, user_id: str, bucket_id: str, identifier: str) -> Optional[sqlite3.Row]:
+        """Cari objek yang bisa diakses user di dalam bucket berdasarkan ID atau nama file.
+        Identifier yang dimulai 'obj-' dianggap ID objek; selain itu dicari sebagai nama file."""
+        if identifier.startswith("obj-"):
+            obj = self.get_object_by_id(identifier)
+            if obj and obj["bucket_id"] == bucket_id and self.check_access(identifier, user_id, "read"):
+                return obj
+            return None
+        # Cari sebagai nama file pada objek yang bisa diakses user di bucket ini
+        subs, params = [], []
+        if bucket_id is not None:
+            subs.append("SELECT * FROM objects WHERE owner_id = ? AND bucket_id = ?")
+            params += [user_id, bucket_id]
+            subs.append("SELECT * FROM objects WHERE is_public = 1 AND bucket_id = ?")
+            params += [bucket_id]
+            subs.append(
+                "SELECT o.* FROM objects o JOIN acl a ON o.id = a.object_id"
+                " WHERE a.user_id = ? AND o.bucket_id = ?"
+            )
+            params += [user_id, bucket_id]
+        else:
+            subs.append("SELECT * FROM objects WHERE owner_id = ?")
+            params.append(user_id)
+            subs.append("SELECT * FROM objects WHERE is_public = 1")
+            subs.append("SELECT o.* FROM objects o JOIN acl a ON o.id = a.object_id WHERE a.user_id = ?")
+            params.append(user_id)
+        params.append(identifier)
+        sql = ("SELECT * FROM (" + " UNION ".join(subs) + ") WHERE filename = ?"
+               " ORDER BY created_at DESC LIMIT 1")
+        cur = self.conn.execute(sql, tuple(params))
         return cur.fetchone()
 
     # ==================== BUCKETS ====================
